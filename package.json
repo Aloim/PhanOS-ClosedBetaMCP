@@ -1,0 +1,54 @@
+{
+  "name": "@phanos/mcp",
+  "version": "0.2.0",
+  "description": "PhanOS installer MCP server: sign in, install and update PhanOS in Claude Code.",
+  "type": "module",
+  "bin": {
+    "phanos-mcp": "dist/index.js"
+  },
+  "exports": {
+    "./trusted-keys": {
+      "source": "./src/trusted-keys.ts",
+      "default": "./dist/trusted-keys.js"
+    },
+    "./release": {
+      "source": "./src/release.ts",
+      "default": "./dist/release.js"
+    },
+    "./feedback": {
+      "source": "./src/feedback.ts",
+      "default": "./dist/feedback.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.1.0",
+    "@napi-rs/keyring": "^2.1.0",
+    "yauzl": "^3.4.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "@types/yauzl": "^3.4.0",
+    "@types/yazl": "^3.3.1",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.2",
+    "yazl": "^3.3.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aloim/PhanOS-ClosedBetaMCP.git"
+  },
+  "homepage": "https://phanos.eu"
+}
