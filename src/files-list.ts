@@ -21,6 +21,8 @@ export interface TreeComparison {
   added: string[];
   missing: string[];
 }
+/** WE-5.01 ruling 6: how one relative path is treated when a release is applied over a live tree. */
+export type FileClass = 'overwrite' | 'same' | 'kept' | 'conflict' | 'carried';
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -115,4 +117,45 @@ export async function compareTree(dir: string, list: FilesList): Promise<TreeCom
   }
   for (const path of listed.keys()) if (!actual.has(path)) missing.push(path);
   return { changed: changed.sort(byteCompare), added: added.sort(byteCompare), missing: missing.sort(byteCompare) };
+}
+
+/**
+ * Pure three-way classification over sha256 hashes (no disk access). stored = the live tree's files.json
+ * (rel -> sha256; null = no stored list, uncheckable); next = the verified release list; disk = sha256 of
+ * each file on disk. Returns one class per path that needs one, keys in byte order; a path absent from
+ * disk and not in next produces no entry.
+ */
+export function classifyThreeWay(
+  stored: ReadonlyMap<string, string> | null,
+  next: ReadonlyMap<string, string>,
+  disk: ReadonlyMap<string, string>,
+): Map<string, FileClass> {
+  const paths = new Set<string>([...next.keys(), ...disk.keys(), ...(stored?.keys() ?? [])]);
+  const out = new Map<string, FileClass>();
+  for (const rel of [...paths].sort(byteCompare)) {
+    const cls = classifyOne(stored === null, stored?.get(rel), next.get(rel), disk.get(rel));
+    if (cls !== undefined) out.set(rel, cls);
+  }
+  return out;
+}
+
+function classifyOne(
+  uncheckable: boolean,
+  s: string | undefined,
+  n: string | undefined,
+  d: string | undefined,
+): FileClass | undefined {
+  // provisional decision: a path in next and absent from disk is restored (overwrite) even when uncheckable,
+  // because nothing on disk can be lost; alternative: conflict, the literal "D differs from N" reading.
+  if (d === undefined) return n === undefined ? undefined : 'overwrite';
+  // provisional decision: when stored is null, a disk file absent from next is a conflict (it cannot be
+  // proven ours to replace); alternative: carried.
+  if (uncheckable) return n === d ? 'same' : 'conflict';
+  // provisional decision: stored = disk = next gives overwrite (the written rule order: D = S first);
+  // alternative: same, since the bytes already match.
+  if (s !== undefined && d === s) return 'overwrite';
+  if (n !== undefined && d === n) return 'same';
+  if (s === undefined) return n === undefined ? 'carried' : 'conflict';
+  if (n === undefined) return 'carried';
+  return n === s ? 'kept' : 'conflict';
 }

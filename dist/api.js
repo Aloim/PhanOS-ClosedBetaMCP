@@ -41,6 +41,31 @@ export async function readAccount(api, session) {
     }
     return { kind: 'known', state: state, me };
 }
+/**
+ * C-10 reading rules: a null manifest is `unread`; an absent switch or downgrade, or `on`, is `on`;
+ * any other value, a null switch included, is `off`. Pure; never throws.
+ */
+export function readKillSwitch(m) {
+    if (m === null || typeof m !== 'object')
+        return 'unread';
+    if (m.switch === undefined)
+        return 'on';
+    if (m.switch === null || typeof m.switch !== 'object')
+        return 'off';
+    const downgrade = m.switch.downgrade;
+    return downgrade === undefined || downgrade === 'on' ? 'on' : 'off';
+}
+/** C-10: reads the free manifest with the session (the `pro` route answers an ended or never account 401). Any thrown error, 404 `no_release` included, is `unread`. */
+export async function fetchKillSwitch(api, session) {
+    let manifest;
+    try {
+        manifest = await api.getManifest('free', session);
+    }
+    catch {
+        return 'unread';
+    }
+    return readKillSwitch(manifest);
+}
 export class HttpApi {
     base;
     fetchImpl;
@@ -131,8 +156,83 @@ export class HttpApi {
             body: JSON.stringify(body),
         }));
     }
+    /** WE-3.04 ruling 2: any thrown error, non-2xx answer, missing key or non-number value is `null`; the method never throws. */
+    async getCorpusVersion(token) {
+        try {
+            const body = await this.ok(await this.send(`${this.base}/api/corpus/manifest.json`, { bearer: token }));
+            const version = body?.corpusVersion;
+            return typeof version === 'number' ? version : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    /** C-9 request headers: the Pro bearer and, when the caller holds the object, its sha256 as a strong quoted `if-none-match`. */
+    contentInit(token, etag) {
+        return { bearer: token, headers: etag === undefined ? {} : { 'if-none-match': `"${etag}"` } };
+    }
+    contentUrl(pluginVersion, rest, pin) {
+        const query = pin === null ? '' : `?pin=${encodeURIComponent(pin)}`;
+        return `${this.base}/api/content/${encodeURIComponent(pluginVersion)}/${rest}${query}`;
+    }
+    /** The ETag without `W/` and quotes, and `x-content-version`, of a 200 or 304 answer. */
+    contentMeta(res) {
+        const etag = (res.headers.get('etag') ?? '').replace(/^W\//, '').replace(/^"|"$/g, '');
+        return { etag, contentVersion: res.headers.get('x-content-version') ?? '' };
+    }
+    async contentFailure(res) {
+        const body = (await res.json().catch(() => null));
+        const error = typeof body?.error === 'string' && body.error !== '' ? body.error : `http_${res.status}`;
+        const message = typeof body?.message === 'string' ? body.message : `The server answered ${res.status}.`;
+        return { status: res.status, error, message };
+    }
+    async getContentManifest(pluginVersion, pin, token, etag) {
+        const res = await this.send(this.contentUrl(pluginVersion, 'manifest', pin), this.contentInit(token, etag));
+        if (res.status === 304)
+            return { status: 304, ...this.contentMeta(res) };
+        if (res.status !== 200)
+            return await this.contentFailure(res);
+        const body = (await res.json().catch(() => null));
+        return { status: 200, ...this.contentMeta(res), body };
+    }
+    async getContentItem(pluginVersion, kind, name, pin, token, etag, maxBytes = 1_048_576) {
+        const res = await this.send(this.contentUrl(pluginVersion, `${encodeURIComponent(kind)}/${encodeURIComponent(name)}`, pin), this.contentInit(token, etag));
+        if (res.status === 304)
+            return { status: 304, ...this.contentMeta(res) };
+        if (res.status !== 200)
+            return await this.contentFailure(res);
+        return { status: 200, ...this.contentMeta(res), body: await this.readCapped(res, maxBytes + 1) };
+    }
+    /** Reads at most `limit` bytes of the body and stops; a stream that dies mid-body is a network failure. */
+    async readCapped(res, limit) {
+        if (!res.body)
+            return new Uint8Array(0);
+        const reader = res.body.getReader();
+        const chunks = [];
+        let total = 0;
+        try {
+            while (total < limit) {
+                const part = await reader.read();
+                if (part.done)
+                    break;
+                chunks.push(part.value);
+                total += part.value.length;
+            }
+        }
+        catch {
+            throw new ApiError(0, 'network', `The connection to ${this.base} dropped. Check your internet connection and try again.`);
+        }
+        finally {
+            await reader.cancel().catch(() => { });
+        }
+        return Buffer.concat(chunks).subarray(0, limit);
+    }
+    /** `serverTime` is whole epoch seconds from the answer's `Date` header; absent when the header is missing or unparsable. */
     async getToken(session, deviceId) {
-        return this.ok(await this.send(`${this.base}/api/entitlement/token`, { method: 'POST', bearer: session, body: JSON.stringify({ deviceId }) }));
+        const res = await this.send(`${this.base}/api/entitlement/token`, { method: 'POST', bearer: session, body: JSON.stringify({ deviceId }) });
+        const body = await this.ok(res);
+        const ms = Date.parse(res.headers.get('date') ?? '');
+        return Number.isFinite(ms) ? { ...body, serverTime: Math.floor(ms / 1000) } : body;
     }
     async getManifest(edition, bearer) {
         return this.ok(await this.send(`${this.base}/api/releases/${edition}/manifest`, { bearer }));

@@ -14,6 +14,7 @@ import {
   type PluginState,
 } from './claude-cli.js';
 import { PLUGIN_IDS, type LocalEdition, type Paths } from './config.js';
+import { readLocalState, withStateLock, writeLocalState, type FlipMark } from './state.js';
 
 /**
  * The edition flip (C1 §4). `decideFlip` is pure: it turns the account answer, the `claude plugin list --json`
@@ -264,8 +265,68 @@ async function step(action: FlipAction, plan: FlipPlan, run: ClaudeRunner, ctx: 
   }
 }
 
-/** Runs the plan's actions in order, re-reading the listing after every install, enable and disable. */
+/**
+ * Sets the `flip` mark in state.json under the state lock (C-4: one writer, the MCP). `waitMs` is 0: a busy lock or
+ * any write error skips the mark, so the mark never blocks or fails the flip. Returns whether the mark was written.
+ * A fresh read keeps every other key. Inside a chain that already holds the lock (the update) it runs at once.
+ */
+async function setFlipMark(paths: Paths, mark: FlipMark): Promise<boolean> {
+  try {
+    await withStateLock(
+      paths,
+      async () => {
+        await writeLocalState(paths, { ...(await readLocalState(paths)), flip: mark });
+      },
+      { waitMs: 0 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes the `flip` key only when it still holds the mark this flip wrote, matched by `startedAt`, so a mark another
+ * session wrote is never erased. Under the state lock with `waitMs` 0: a busy lock or any error leaves the mark in
+ * place and never fails the flip. Inside a chain that already holds the lock (the update) it runs at once.
+ */
+async function clearFlipMark(paths: Paths, mark: FlipMark): Promise<void> {
+  try {
+    await withStateLock(
+      paths,
+      async () => {
+        const state = await readLocalState(paths);
+        const flip = state.flip;
+        if (flip?.inProgress !== true || flip.startedAt !== mark.startedAt) return;
+        const next = { ...state };
+        delete next.flip;
+        await writeLocalState(paths, next);
+      },
+      { waitMs: 0 },
+    );
+  } catch {
+    /* never fails the flip */
+  }
+}
+
+/**
+ * Runs the plan's actions in order, re-reading the listing after every install, enable and disable. A plan with
+ * actions sets the `flip` mark in state.json before its first CLI call and clears it in `finally`, on success, on an
+ * early return and when a step throws (WE-3.03, C-4). The mark never blocks or fails the flip: when the lock is busy
+ * or the write fails, the flip runs without a mark and clears nothing.
+ */
 export async function executeFlip(plan: FlipPlan, run: ClaudeRunner, ctx: FlipContext): Promise<FlipResult> {
+  if (plan.actions.length === 0) return runFlipActions(plan, run, ctx);
+  const mark: FlipMark = { inProgress: true, startedAt: Math.floor(Date.now() / 1000) };
+  const marked = await setFlipMark(ctx.paths, mark);
+  try {
+    return await runFlipActions(plan, run, ctx);
+  } finally {
+    if (marked) await clearFlipMark(ctx.paths, mark);
+  }
+}
+
+async function runFlipActions(plan: FlipPlan, run: ClaudeRunner, ctx: FlipContext): Promise<FlipResult> {
   let listing: Listing | null = null;
   let changed = false;
   for (const action of plan.actions) {

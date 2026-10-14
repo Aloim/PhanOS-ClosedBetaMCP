@@ -1,5 +1,6 @@
 // cyphor-role: IO
 import { CLIENT_ID, type LocalEdition } from './config.js';
+import type { ContentKind } from './content-manifest.js';
 import type { FeedbackReceipt, FeedbackWire } from './feedback.js';
 import type { Edition } from './state.js';
 import { MCP_VERSION } from './version.js';
@@ -69,7 +70,50 @@ export type DevicePoll =
 export interface SignedManifest {
   manifest: string;
   signature: { kid: string; sig: string };
+  /** C-10: beside the signed text, not covered by it. Read it through `readKillSwitch`, never directly. */
+  switch?: { downgrade?: unknown };
 }
+
+/** C-10: `on` allows downgrades, `off` stops them, `unread` means the manifest could not be read (no downgrade at this start). */
+export type KillSwitch = 'on' | 'off' | 'unread';
+
+/**
+ * C-10 reading rules: a null manifest is `unread`; an absent switch or downgrade, or `on`, is `on`;
+ * any other value, a null switch included, is `off`. Pure; never throws.
+ */
+export function readKillSwitch(m: SignedManifest | null): KillSwitch {
+  if (m === null || typeof m !== 'object') return 'unread';
+  if (m.switch === undefined) return 'on';
+  if (m.switch === null || typeof m.switch !== 'object') return 'off';
+  const downgrade = m.switch.downgrade;
+  return downgrade === undefined || downgrade === 'on' ? 'on' : 'off';
+}
+
+/** C-10: reads the free manifest with the session (the `pro` route answers an ended or never account 401). Any thrown error, 404 `no_release` included, is `unread`. */
+export async function fetchKillSwitch(api: Pick<Api, 'getManifest'>, session: string): Promise<KillSwitch> {
+  let manifest: SignedManifest;
+  try {
+    manifest = await api.getManifest('free', session);
+  } catch {
+    return 'unread';
+  }
+  return readKillSwitch(manifest);
+}
+
+/** C-9 `/manifest` body (03_c9-wire-client.md section 3). The client validates the shape; a 200 that does not parse arrives as `null`. */
+export interface ContentEnvelope {
+  pluginVersion: string;
+  contentVersion: string;
+  sha256: string;
+  manifest: string;
+  signature: { kid: string; sig: string };
+}
+
+/** C-9 answer: 200 and 304 carry the ETag (quotes and `W/` stripped) and `x-content-version`; every other status carries `error` (`body.error ?? http_<status>`). */
+export type ContentAnswer<T> =
+  | { status: 200; etag: string; contentVersion: string; body: T }
+  | { status: 304; etag: string; contentVersion: string }
+  | { status: number; error: string; message: string };
 
 export interface Api {
   startDeviceFlow(): Promise<DeviceFlowStart>;
@@ -79,7 +123,7 @@ export interface Api {
   deleteDevice(session: string, id: string): Promise<void>;
   /** C1 §3.3: best-effort device report, `PUT /api/entitlement/devices/:id/state` with the session bearer. Resolves on 204, throws `ApiError` otherwise. */
   reportDeviceState(session: string, deviceId: string, state: { enabled: LocalEdition; version: string }): Promise<void>;
-  getToken(session: string, deviceId: string): Promise<{ token: string; expiresAt: string; plan: 'pro' | 'business' }>;
+  getToken(session: string, deviceId: string): Promise<{ token: string; expiresAt: string; plan: 'pro' | 'business'; serverTime?: number }>;
   /** `bearer` is the session token for `free` (C1 §3.3, W3) and the entitlement token for `pro`. */
   getManifest(edition: Edition, bearer?: string): Promise<SignedManifest>;
   downloadArchive(edition: Edition, file: string, token?: string): Promise<Buffer>;
@@ -90,6 +134,15 @@ export interface Api {
   downloadArtifact(edition: Edition, file: string, bearer: string | undefined, expectedSize: number): Promise<Buffer>;
   /** C1 section 18: `POST /api/feedback` with the session bearer. Resolves with the 201 receipt, throws `ApiError` otherwise. */
   submitFeedback(session: string, body: FeedbackWire): Promise<FeedbackReceipt>;
+  /** WE-3.04 ruling 2: the numeric `corpusVersion` of `GET /api/corpus/manifest.json` with the Pro token; `null` on any failure. Never throws. */
+  getCorpusVersion(token: string): Promise<number | null>;
+  /**
+   * C-9 `GET /api/content/<pluginVersion>/manifest[?pin=]` with the Pro token. `etag` is the cached manifest sha256 (lowercase hex; sent quoted as
+   * `if-none-match`). Every HTTP status returns; a network failure throws `ApiError(0, 'network')`. Optional: a fake without it reads as "server unreachable".
+   */
+  getContentManifest?(pluginVersion: string, pin: string | null, token: string, etag?: string): Promise<ContentAnswer<ContentEnvelope>>;
+  /** C-9 `GET /api/content/<pluginVersion>/<kind>/<name>[?pin=]`; the body is cut off after `maxBytes + 1` bytes (default 1 MiB), so a longer body fails the caller's length check. Optional like `getContentManifest`. */
+  getContentItem?(pluginVersion: string, kind: ContentKind, name: string, pin: string | null, token: string, etag?: string, maxBytes?: number): Promise<ContentAnswer<Uint8Array>>;
 }
 
 export class HttpApi implements Api {
@@ -181,10 +234,90 @@ export class HttpApi implements Api {
     );
   }
 
-  async getToken(session: string, deviceId: string) {
-    return this.ok<{ token: string; expiresAt: string; plan: 'pro' | 'business' }>(
-      await this.send(`${this.base}/api/entitlement/token`, { method: 'POST', bearer: session, body: JSON.stringify({ deviceId }) }),
-    );
+  /** WE-3.04 ruling 2: any thrown error, non-2xx answer, missing key or non-number value is `null`; the method never throws. */
+  async getCorpusVersion(token: string): Promise<number | null> {
+    try {
+      const body = await this.ok<{ corpusVersion?: unknown } | null>(await this.send(`${this.base}/api/corpus/manifest.json`, { bearer: token }));
+      const version = body?.corpusVersion;
+      return typeof version === 'number' ? version : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** C-9 request headers: the Pro bearer and, when the caller holds the object, its sha256 as a strong quoted `if-none-match`. */
+  private contentInit(token: string, etag: string | undefined): RequestInit & { bearer: string } {
+    return { bearer: token, headers: etag === undefined ? {} : { 'if-none-match': `"${etag}"` } };
+  }
+
+  private contentUrl(pluginVersion: string, rest: string, pin: string | null): string {
+    const query = pin === null ? '' : `?pin=${encodeURIComponent(pin)}`;
+    return `${this.base}/api/content/${encodeURIComponent(pluginVersion)}/${rest}${query}`;
+  }
+
+  /** The ETag without `W/` and quotes, and `x-content-version`, of a 200 or 304 answer. */
+  private contentMeta(res: Response): { etag: string; contentVersion: string } {
+    const etag = (res.headers.get('etag') ?? '').replace(/^W\//, '').replace(/^"|"$/g, '');
+    return { etag, contentVersion: res.headers.get('x-content-version') ?? '' };
+  }
+
+  private async contentFailure(res: Response): Promise<{ status: number; error: string; message: string }> {
+    const body = (await res.json().catch(() => null)) as { error?: unknown; message?: unknown } | null;
+    const error = typeof body?.error === 'string' && body.error !== '' ? body.error : `http_${res.status}`;
+    const message = typeof body?.message === 'string' ? body.message : `The server answered ${res.status}.`;
+    return { status: res.status, error, message };
+  }
+
+  async getContentManifest(pluginVersion: string, pin: string | null, token: string, etag?: string): Promise<ContentAnswer<ContentEnvelope>> {
+    const res = await this.send(this.contentUrl(pluginVersion, 'manifest', pin), this.contentInit(token, etag));
+    if (res.status === 304) return { status: 304, ...this.contentMeta(res) };
+    if (res.status !== 200) return await this.contentFailure(res);
+    const body = (await res.json().catch(() => null)) as ContentEnvelope;
+    return { status: 200, ...this.contentMeta(res), body };
+  }
+
+  async getContentItem(
+    pluginVersion: string,
+    kind: ContentKind,
+    name: string,
+    pin: string | null,
+    token: string,
+    etag?: string,
+    maxBytes = 1_048_576,
+  ): Promise<ContentAnswer<Uint8Array>> {
+    const res = await this.send(this.contentUrl(pluginVersion, `${encodeURIComponent(kind)}/${encodeURIComponent(name)}`, pin), this.contentInit(token, etag));
+    if (res.status === 304) return { status: 304, ...this.contentMeta(res) };
+    if (res.status !== 200) return await this.contentFailure(res);
+    return { status: 200, ...this.contentMeta(res), body: await this.readCapped(res, maxBytes + 1) };
+  }
+
+  /** Reads at most `limit` bytes of the body and stops; a stream that dies mid-body is a network failure. */
+  private async readCapped(res: Response, limit: number): Promise<Uint8Array> {
+    if (!res.body) return new Uint8Array(0);
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (total < limit) {
+        const part = await reader.read();
+        if (part.done) break;
+        chunks.push(part.value);
+        total += part.value.length;
+      }
+    } catch {
+      throw new ApiError(0, 'network', `The connection to ${this.base} dropped. Check your internet connection and try again.`);
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    return Buffer.concat(chunks).subarray(0, limit);
+  }
+
+  /** `serverTime` is whole epoch seconds from the answer's `Date` header; absent when the header is missing or unparsable. */
+  async getToken(session: string, deviceId: string): Promise<{ token: string; expiresAt: string; plan: 'pro' | 'business'; serverTime?: number }> {
+    const res = await this.send(`${this.base}/api/entitlement/token`, { method: 'POST', bearer: session, body: JSON.stringify({ deviceId }) });
+    const body = await this.ok<{ token: string; expiresAt: string; plan: 'pro' | 'business' }>(res);
+    const ms = Date.parse(res.headers.get('date') ?? '');
+    return Number.isFinite(ms) ? { ...body, serverTime: Math.floor(ms / 1000) } : body;
   }
 
   async getManifest(edition: Edition, bearer?: string): Promise<SignedManifest> {
