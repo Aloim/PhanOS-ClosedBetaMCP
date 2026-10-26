@@ -167,9 +167,14 @@ export class HttpApi {
             return null;
         }
     }
-    /** C-9 request headers: the Pro bearer and, when the caller holds the object, its sha256 as a strong quoted `if-none-match`. */
-    contentInit(token, etag) {
-        return { bearer: token, headers: etag === undefined ? {} : { 'if-none-match': `"${etag}"` } };
+    /** C-9 request headers: the Pro bearer and, when the caller holds the object, its sha256 as a strong quoted `if-none-match`; the install id, when given. */
+    contentInit(token, etag, installId) {
+        const headers = {};
+        if (etag !== undefined)
+            headers['if-none-match'] = `"${etag}"`;
+        if (installId)
+            headers['X-PhanOS-Install-Id'] = installId;
+        return { bearer: token, headers };
     }
     contentUrl(pluginVersion, rest, pin) {
         const query = pin === null ? '' : `?pin=${encodeURIComponent(pin)}`;
@@ -195,8 +200,8 @@ export class HttpApi {
         const body = (await res.json().catch(() => null));
         return { status: 200, ...this.contentMeta(res), body };
     }
-    async getContentItem(pluginVersion, kind, name, pin, token, etag, maxBytes = 1_048_576) {
-        const res = await this.send(this.contentUrl(pluginVersion, `${encodeURIComponent(kind)}/${encodeURIComponent(name)}`, pin), this.contentInit(token, etag));
+    async getContentItem(pluginVersion, kind, name, pin, token, etag, maxBytes = 1_048_576, installId) {
+        const res = await this.send(this.contentUrl(pluginVersion, `${encodeURIComponent(kind)}/${encodeURIComponent(name)}`, pin), this.contentInit(token, etag, installId));
         if (res.status === 304)
             return { status: 304, ...this.contentMeta(res) };
         if (res.status !== 200)

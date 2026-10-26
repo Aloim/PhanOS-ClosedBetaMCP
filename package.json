@@ -1,6 +1,6 @@
 {
   "name": "@phanos/mcp",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "PhanOS installer MCP server: sign in, install and update PhanOS in Claude Code.",
   "type": "module",
   "bin": {

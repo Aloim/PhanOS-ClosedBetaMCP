@@ -9,7 +9,7 @@ import type { TrustedKey } from './trusted-keys.js';
 /** Every refusal of this module carries its reason as `message`: `unknown key (...)`, `signature invalid`, `malformed`, `kid mismatch (...)`. */
 export class ContentVerificationError extends Error {}
 
-export const CONTENT_KINDS = ['skill', 'workflow', 'agent', 'corpus', 'template'] as const;
+export const CONTENT_KINDS = ['skill', 'workflow', 'agent', 'corpus', 'template', 'session'] as const;
 export type ContentKind = (typeof CONTENT_KINDS)[number];
 
 /** The three loose release asset names (02_c9-wire-server.md section 8). */

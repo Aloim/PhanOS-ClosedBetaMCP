@@ -40,7 +40,7 @@ import { TRUSTED_RELEASE_KEYS, type TrustedKey } from './trusted-keys.js';
 import { MCP_VERSION } from './version.js';
 
 /** PROVISIONAL (03_c9-wire-client.md section 6): the Pro plugin versions this MCP serves text to, `min <= v < below` by core triple. */
-export const SUPPORTS_PLUGIN = { min: '0.2.5', below: '0.3.0' } as const;
+export const SUPPORTS_PLUGIN = { min: '0.2.5', below: '0.4.0' } as const;
 
 /** Mirrors the service's token refresh window (service.ts REFRESH_BEFORE_MS): inside it the service is asked for a fresh token. */
 const REFRESH_WINDOW_MS = 3 * 86_400_000;
@@ -59,6 +59,8 @@ export interface ContentOutcome {
   contentVersion?: string;
   sha256?: string;
   body?: string;
+  /** On an item answer: the verified bytes (the ones whose sha256 was checked). */
+  bytes?: Uint8Array;
   /** Present exactly when `ok` is false. */
   result?: string;
 }
@@ -66,6 +68,8 @@ export interface ContentOutcome {
 export interface ContentDeps {
   api: Pick<Api, 'getContentManifest' | 'getContentItem'>;
   paths: Paths;
+  /** Sent as `X-PhanOS-Install-Id` on a `session` item request only (the server requires it for that kind). */
+  installId?: string;
   /** Clock; default the system clock. */
   now?: () => Date;
   /**
@@ -105,7 +109,7 @@ function compareCore(a: Triple['core'], b: Triple['core']): number {
   return 0;
 }
 
-/** `min <= v < below` by core triple; a prerelease counts below its own core (so `0.2.5-rc.1` is refused, and so is `0.3.0-rc.1`). */
+/** `min <= v < below` by core triple; a prerelease counts below its own core (so `0.2.5-rc.1` is refused, and so is `0.4.0-rc.1`). */
 export function supportsPlugin(pluginVersion: string): boolean {
   const v = parseTriple(pluginVersion);
   const min = parseTriple(SUPPORTS_PLUGIN.min);
@@ -191,6 +195,7 @@ const okItem = (ctx: Ctx, set: CachedSet, entry: ContentFile, body: Uint8Array):
   contentVersion: set.manifest.contentVersion,
   sha256: entry.sha256,
   body: Buffer.from(body).toString('utf8'),
+  bytes: body,
 });
 
 /** A cached set may answer for this request only at or above the pin, and bound to the pin's hash when it is the pinned set. */
@@ -293,6 +298,7 @@ async function fetchManifest(ctx: Ctx, cached: CachedSet | null, useEtag: boolea
 async function serveFromCache(ctx: Ctx, set: CachedSet | null, reason: string, key: string | null): Promise<ContentOutcome> {
   if (set === null) return unavailable(reason);
   if (key === null) return okManifest(ctx, set);
+  if (key.startsWith('session/')) return unavailable(reason); // F-16801: a session item is never read from the cache
   const entry = set.manifest.files[key];
   if (entry === undefined) return unavailable(reason);
   const body = await readCachedItem(ctx.home, set, key);
@@ -303,6 +309,8 @@ async function serveFromCache(ctx: Ctx, set: CachedSet | null, reason: string, k
 async function fetchItem(ctx: Ctx, first: CachedSet, kind: ContentKind, name: string): Promise<ContentOutcome> {
   const call = ctx.deps.api.getContentItem;
   const key = `${kind}/${name}`;
+  // F-16801: a session item is never stored in or read from the content cache, and never sent with a validator.
+  const session = kind === 'session';
   let set = first;
   let refetched = false;
   let withEtag = true;
@@ -310,10 +318,10 @@ async function fetchItem(ctx: Ctx, first: CachedSet, kind: ContentKind, name: st
     const entry = set.manifest.files[key];
     if (entry === undefined) return refused('not_found');
     if (call === undefined) return await serveFromCache(ctx, set, 'offline, grace', key);
-    const held = withEtag ? await readCachedItem(ctx.home, set, key) : null;
+    const held = withEtag && !session ? await readCachedItem(ctx.home, set, key) : null;
     let answer;
     try {
-      answer = await call.call(ctx.deps.api, ctx.pluginVersion, kind, name, set.manifest.contentVersion, ctx.token, held === null ? undefined : entry.sha256, entry.bytes);
+      answer = await call.call(ctx.deps.api, ctx.pluginVersion, kind, name, set.manifest.contentVersion, ctx.token, held === null ? undefined : entry.sha256, entry.bytes, session ? ctx.deps.installId : undefined);
     } catch (e) {
       if (e instanceof ApiError && e.status === 0) return await serveFromCache(ctx, set, 'offline, grace', key);
       throw e;
@@ -342,7 +350,7 @@ async function fetchItem(ctx: Ctx, first: CachedSet, kind: ContentKind, name: st
     }
     const body = Buffer.from(answer.body);
     if (body.length !== entry.bytes || sha256Hex(body) !== entry.sha256) return MISMATCH; // nothing is cached
-    await tryCache(() => storeItem(ctx.home, set, key, body, ctx.fetchedAt));
+    if (!session) await tryCache(() => storeItem(ctx.home, set, key, body, ctx.fetchedAt));
     return okItem(ctx, set, entry, body);
   }
 }

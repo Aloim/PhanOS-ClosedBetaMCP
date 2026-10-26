@@ -15,6 +15,7 @@ import { checkLiveTree, FilesInUseError, installPluginTree, LocalChangesError, O
 import { pruneProjectPointers } from './pointer-prune.js';
 import { checkPrerequisites } from './prereqs.js';
 import { ACCEPT_SCHEMA_1, checkArchive, ReleaseVerificationError, verifyRelease } from './release.js';
+import { sessionStatusLines } from './session-status.js';
 import { mergeClaudeEnv, removeClaudeEnv } from './settings.js';
 import { createExecRunner, createShortcut, removeShortcut } from './shortcut.js';
 import { deleteToken, maxServerTime, readLocalState, readToken, recordLaunch, StateLockBusyError, tokenExpiry, withStateLock, writeLocalState, writeToken } from './state.js';
@@ -280,7 +281,7 @@ export function createPhanosService(d) {
         }
     }
     /** WE-3.04 rulings 1-4: the lines that follow the installed line, before the flip text. `reachable` is this pass's account read. */
-    function statusBlocks(state, reachable, corpusVersion, content) {
+    function statusBlocks(state, reachable, corpusVersion, content, session) {
         const iso = (sec) => new Date(sec * 1000).toISOString();
         const lines = [];
         if (loaded === null)
@@ -293,6 +294,7 @@ export function createPhanosService(d) {
             lines.push(`Enabled for the next session: PhanOS ${LABEL[state.enabled]}`);
         lines.push(`server: reachable ${reachable ? 'yes' : 'no'}, corpusVersion ${corpusVersion ?? 'null'}, lastOk ${lastOk ?? 'never'}`);
         lines.push(...content);
+        lines.push(...session);
         const sw = state.switch;
         if (!sw?.lastRun)
             lines.push('switch: no switch run yet');
@@ -474,7 +476,8 @@ export function createPhanosService(d) {
         if (full)
             await reconcileContent();
         const contentLines = await contentStatusLines(contentDeps(), { probe: full });
-        lines.push(installedLine(state), ...statusBlocks(state, reachable, corpusVersion, contentLines));
+        const sessionLines = await sessionStatusLines({ paths: d.paths, env: d.env ?? process.env, coordRole: d.coordRole });
+        lines.push(installedLine(state), ...statusBlocks(state, reachable, corpusVersion, contentLines, sessionLines));
         if (flipText)
             lines.push(flipText);
         if (!full)
@@ -1096,6 +1099,8 @@ export function createPhanosService(d) {
         startCheck,
         /** P-3: one `phanos_content` call (C-9); the trusted keys are the release-signing keys the service is built with. Outside `serial`: a skill load never waits behind an install. */
         content: (input) => loadContent(contentDeps(), input, d.trustedKeys),
+        /** F-17067: the same deps the content calls use (with the token refresh), for the session runtime's `content` deps. */
+        contentDeps,
         /** C1 section 18: outside `serial` on purpose; it touches no local state, so it must not wait behind an install or a slow start check. */
         feedback: (input) => sendFeedback({ getSession: () => d.secrets.get(), submit: (s, b) => d.api.submitFeedback(s, b) }, input),
     };

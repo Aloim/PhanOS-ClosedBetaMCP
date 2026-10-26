@@ -16,6 +16,7 @@ import { pruneProjectPointers } from './pointer-prune.js';
 import { checkPrerequisites, type CommandRunnerFactory } from './prereqs.js';
 import { ACCEPT_SCHEMA_1, checkArchive, ReleaseVerificationError, verifyRelease, type ReleaseEnv, type VerifiedRelease } from './release.js';
 import type { SecretStore } from './secrets.js';
+import { sessionStatusLines, type CoordRole } from './session-status.js';
 import { mergeClaudeEnv, removeClaudeEnv } from './settings.js';
 import { createExecRunner, createShortcut, removeShortcut, type CommandRunner } from './shortcut.js';
 import { deleteToken, maxServerTime, readLocalState, readToken, recordLaunch, StateLockBusyError, tokenExpiry, withStateLock, writeLocalState, writeToken, type LocalStateV2 } from './state.js';
@@ -55,6 +56,10 @@ export interface ServiceDeps {
   pruneProjectPointers?: typeof pruneProjectPointers;
   /** F-16076: test seams over the state-lock wait of each pass (ms) and its poll interval; LOCK_WAIT_MS and 200 ms otherwise. */
   stateLock?: { waitMs?: Partial<Record<LockedPass, number>>; pollMs?: number };
+  /** S5-2.07: the process environment the session set and coordination read (CLAUDE_PROJECT_DIR, CLAUDE_CODE_SESSION_ID); process.env by default. */
+  env?: NodeJS.ProcessEnv;
+  /** S5-2.07: the coordination drain's role when this process runs it; absent otherwise (the status line then falls back, see session-status.ts). */
+  coordRole?: () => CoordRole | undefined;
 }
 
 /** F-16076: every public pass that writes state.json; each holds state.json.lock for its whole run (see `locked`). */
@@ -367,7 +372,7 @@ export function createPhanosService(d: ServiceDeps) {
   }
 
   /** WE-3.04 rulings 1-4: the lines that follow the installed line, before the flip text. `reachable` is this pass's account read. */
-  function statusBlocks(state: LocalStateV2, reachable: boolean, corpusVersion: number | null, content: readonly string[]): string[] {
+  function statusBlocks(state: LocalStateV2, reachable: boolean, corpusVersion: number | null, content: readonly string[], session: readonly string[]): string[] {
     const iso = (sec: number): string => new Date(sec * 1000).toISOString();
     const lines: string[] = [];
     if (loaded === null) lines.push('Loaded in this session: unknown (no plugin listing read yet)');
@@ -376,6 +381,7 @@ export function createPhanosService(d: ServiceDeps) {
     if (loaded !== null && state.enabled && state.enabled !== loaded) lines.push(`Enabled for the next session: PhanOS ${LABEL[state.enabled]}`);
     lines.push(`server: reachable ${reachable ? 'yes' : 'no'}, corpusVersion ${corpusVersion ?? 'null'}, lastOk ${lastOk ?? 'never'}`);
     lines.push(...content);
+    lines.push(...session);
     const sw = state.switch;
     if (!sw?.lastRun) lines.push('switch: no switch run yet');
     else {
@@ -543,7 +549,8 @@ export function createPhanosService(d: ServiceDeps) {
     // P-3 (section 5, section 9): the full pass runs the grace reconcile and the one manifest request; the degraded pass only reads.
     if (full) await reconcileContent();
     const contentLines = await contentStatusLines(contentDeps(), { probe: full });
-    lines.push(installedLine(state), ...statusBlocks(state, reachable, corpusVersion, contentLines));
+    const sessionLines = await sessionStatusLines({ paths: d.paths, env: d.env ?? process.env, coordRole: d.coordRole });
+    lines.push(installedLine(state), ...statusBlocks(state, reachable, corpusVersion, contentLines, sessionLines));
     if (flipText) lines.push(flipText);
     if (!full) lines.push(BUSY_STATUS);
     return lines.join('\n');
@@ -1111,6 +1118,8 @@ export function createPhanosService(d: ServiceDeps) {
     startCheck,
     /** P-3: one `phanos_content` call (C-9); the trusted keys are the release-signing keys the service is built with. Outside `serial`: a skill load never waits behind an install. */
     content: (input: ContentInput) => loadContent(contentDeps(), input, d.trustedKeys),
+    /** F-17067: the same deps the content calls use (with the token refresh), for the session runtime's `content` deps. */
+    contentDeps,
     /** C1 section 18: outside `serial` on purpose; it touches no local state, so it must not wait behind an install or a slow start check. */
     feedback: (input: unknown) => sendFeedback({ getSession: () => d.secrets.get(), submit: (s, b) => d.api.submitFeedback(s, b) }, input),
   };

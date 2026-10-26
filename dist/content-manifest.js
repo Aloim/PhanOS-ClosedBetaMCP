@@ -6,7 +6,7 @@ import { createPublicKey, verify } from 'node:crypto';
 /** Every refusal of this module carries its reason as `message`: `unknown key (...)`, `signature invalid`, `malformed`, `kid mismatch (...)`. */
 export class ContentVerificationError extends Error {
 }
-export const CONTENT_KINDS = ['skill', 'workflow', 'agent', 'corpus', 'template'];
+export const CONTENT_KINDS = ['skill', 'workflow', 'agent', 'corpus', 'template', 'session'];
 /** The three loose release asset names (02_c9-wire-server.md section 8). */
 export const CONTENT_MANIFEST_ASSET = 'content-manifest.json';
 export const CONTENT_SIGNATURE_ASSET = 'content-manifest.json.sig';

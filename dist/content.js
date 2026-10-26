@@ -13,7 +13,7 @@ import { readLocalState, readToken, StateLockBusyError, tokenExpiry } from './st
 import { TRUSTED_RELEASE_KEYS } from './trusted-keys.js';
 import { MCP_VERSION } from './version.js';
 /** PROVISIONAL (03_c9-wire-client.md section 6): the Pro plugin versions this MCP serves text to, `min <= v < below` by core triple. */
-export const SUPPORTS_PLUGIN = { min: '0.2.5', below: '0.3.0' };
+export const SUPPORTS_PLUGIN = { min: '0.2.5', below: '0.4.0' };
 /** Mirrors the service's token refresh window (service.ts REFRESH_BEFORE_MS): inside it the service is asked for a fresh token. */
 const REFRESH_WINDOW_MS = 3 * 86_400_000;
 /** The text form of the tool answer: the body when `ok`, else the one-line `result: ...`. */
@@ -37,7 +37,7 @@ function compareCore(a, b) {
             return a[i] < b[i] ? -1 : 1;
     return 0;
 }
-/** `min <= v < below` by core triple; a prerelease counts below its own core (so `0.2.5-rc.1` is refused, and so is `0.3.0-rc.1`). */
+/** `min <= v < below` by core triple; a prerelease counts below its own core (so `0.2.5-rc.1` is refused, and so is `0.4.0-rc.1`). */
 export function supportsPlugin(pluginVersion) {
     const v = parseTriple(pluginVersion);
     const min = parseTriple(SUPPORTS_PLUGIN.min);
@@ -113,6 +113,7 @@ const okItem = (ctx, set, entry, body) => ({
     contentVersion: set.manifest.contentVersion,
     sha256: entry.sha256,
     body: Buffer.from(body).toString('utf8'),
+    bytes: body,
 });
 /** A cached set may answer for this request only at or above the pin, and bound to the pin's hash when it is the pinned set. */
 function usable(ctx, set) {
@@ -227,6 +228,8 @@ async function serveFromCache(ctx, set, reason, key) {
         return unavailable(reason);
     if (key === null)
         return okManifest(ctx, set);
+    if (key.startsWith('session/'))
+        return unavailable(reason); // F-16801: a session item is never read from the cache
     const entry = set.manifest.files[key];
     if (entry === undefined)
         return unavailable(reason);
@@ -237,6 +240,8 @@ async function serveFromCache(ctx, set, reason, key) {
 async function fetchItem(ctx, first, kind, name) {
     const call = ctx.deps.api.getContentItem;
     const key = `${kind}/${name}`;
+    // F-16801: a session item is never stored in or read from the content cache, and never sent with a validator.
+    const session = kind === 'session';
     let set = first;
     let refetched = false;
     let withEtag = true;
@@ -246,10 +251,10 @@ async function fetchItem(ctx, first, kind, name) {
             return refused('not_found');
         if (call === undefined)
             return await serveFromCache(ctx, set, 'offline, grace', key);
-        const held = withEtag ? await readCachedItem(ctx.home, set, key) : null;
+        const held = withEtag && !session ? await readCachedItem(ctx.home, set, key) : null;
         let answer;
         try {
-            answer = await call.call(ctx.deps.api, ctx.pluginVersion, kind, name, set.manifest.contentVersion, ctx.token, held === null ? undefined : entry.sha256, entry.bytes);
+            answer = await call.call(ctx.deps.api, ctx.pluginVersion, kind, name, set.manifest.contentVersion, ctx.token, held === null ? undefined : entry.sha256, entry.bytes, session ? ctx.deps.installId : undefined);
         }
         catch (e) {
             if (e instanceof ApiError && e.status === 0)
@@ -286,7 +291,8 @@ async function fetchItem(ctx, first, kind, name) {
         const body = Buffer.from(answer.body);
         if (body.length !== entry.bytes || sha256Hex(body) !== entry.sha256)
             return MISMATCH; // nothing is cached
-        await tryCache(() => storeItem(ctx.home, set, key, body, ctx.fetchedAt));
+        if (!session)
+            await tryCache(() => storeItem(ctx.home, set, key, body, ctx.fetchedAt));
         return okItem(ctx, set, entry, body);
     }
 }

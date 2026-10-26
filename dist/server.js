@@ -96,7 +96,9 @@ export function buildServer(svc, version, opts = {}) {
     if (wanted('phanos_content')) {
         server.registerTool('phanos_content', { description: CONTENT_TOOL_DESCRIPTION, inputSchema: contentInputSchema, outputSchema: contentOutputSchema }, async ({ kind, name, pluginVersion }) => {
             const outcome = await svc.content({ kind, ...(name !== undefined ? { name } : {}), ...(pluginVersion !== undefined ? { pluginVersion } : {}) });
-            return { content: [{ type: 'text', text: contentOutcomeText(outcome) }], structuredContent: outcome, isError: !outcome.ok };
+            // F-17068: the raw bytes (a Uint8Array) stay in-process; they are not part of the MCP payload.
+            const { bytes: _bytes, ...visible } = outcome;
+            return { content: [{ type: 'text', text: contentOutcomeText(outcome) }], structuredContent: visible, isError: !outcome.ok };
         });
     }
     return server;

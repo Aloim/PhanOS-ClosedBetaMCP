@@ -15,7 +15,7 @@ You need Node.js 22.12 or newer and Git.
 
 For a careful install, pin the version instead:
 
-    claude mcp add phanos -- npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.2.5
+    claude mcp add phanos -- npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.0
 
 Every install signs in with your PhanOS account. Then ask Claude to run:
 - `phanos_login` — confirm the code in your browser

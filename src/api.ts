@@ -141,8 +141,8 @@ export interface Api {
    * `if-none-match`). Every HTTP status returns; a network failure throws `ApiError(0, 'network')`. Optional: a fake without it reads as "server unreachable".
    */
   getContentManifest?(pluginVersion: string, pin: string | null, token: string, etag?: string): Promise<ContentAnswer<ContentEnvelope>>;
-  /** C-9 `GET /api/content/<pluginVersion>/<kind>/<name>[?pin=]`; the body is cut off after `maxBytes + 1` bytes (default 1 MiB), so a longer body fails the caller's length check. Optional like `getContentManifest`. */
-  getContentItem?(pluginVersion: string, kind: ContentKind, name: string, pin: string | null, token: string, etag?: string, maxBytes?: number): Promise<ContentAnswer<Uint8Array>>;
+  /** C-9 `GET /api/content/<pluginVersion>/<kind>/<name>[?pin=]`; the body is cut off after `maxBytes + 1` bytes (default 1 MiB), so a longer body fails the caller's length check. Optional like `getContentManifest`. `installId`, when given, is sent as `X-PhanOS-Install-Id`. */
+  getContentItem?(pluginVersion: string, kind: ContentKind, name: string, pin: string | null, token: string, etag?: string, maxBytes?: number, installId?: string): Promise<ContentAnswer<Uint8Array>>;
 }
 
 export class HttpApi implements Api {
@@ -245,9 +245,12 @@ export class HttpApi implements Api {
     }
   }
 
-  /** C-9 request headers: the Pro bearer and, when the caller holds the object, its sha256 as a strong quoted `if-none-match`. */
-  private contentInit(token: string, etag: string | undefined): RequestInit & { bearer: string } {
-    return { bearer: token, headers: etag === undefined ? {} : { 'if-none-match': `"${etag}"` } };
+  /** C-9 request headers: the Pro bearer and, when the caller holds the object, its sha256 as a strong quoted `if-none-match`; the install id, when given. */
+  private contentInit(token: string, etag: string | undefined, installId?: string): RequestInit & { bearer: string } {
+    const headers: Record<string, string> = {};
+    if (etag !== undefined) headers['if-none-match'] = `"${etag}"`;
+    if (installId) headers['X-PhanOS-Install-Id'] = installId;
+    return { bearer: token, headers };
   }
 
   private contentUrl(pluginVersion: string, rest: string, pin: string | null): string {
@@ -284,8 +287,9 @@ export class HttpApi implements Api {
     token: string,
     etag?: string,
     maxBytes = 1_048_576,
+    installId?: string,
   ): Promise<ContentAnswer<Uint8Array>> {
-    const res = await this.send(this.contentUrl(pluginVersion, `${encodeURIComponent(kind)}/${encodeURIComponent(name)}`, pin), this.contentInit(token, etag));
+    const res = await this.send(this.contentUrl(pluginVersion, `${encodeURIComponent(kind)}/${encodeURIComponent(name)}`, pin), this.contentInit(token, etag, installId));
     if (res.status === 304) return { status: 304, ...this.contentMeta(res) };
     if (res.status !== 200) return await this.contentFailure(res);
     return { status: 200, ...this.contentMeta(res), body: await this.readCapped(res, maxBytes + 1) };
