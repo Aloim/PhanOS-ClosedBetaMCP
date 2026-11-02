@@ -37,7 +37,7 @@ const Manifest2Schema = z.object({
     version: Version,
     publishedAt: z.string(),
     artifacts: z.array(z.looseObject({ kind: z.string() })),
-    requires: z.object({ mcp: z.string().optional(), node: z.string().optional() }).optional(),
+    requires: z.object({ mcp: z.string().optional(), node: z.string().optional(), ui: z.string().optional() }).optional(),
 });
 const MALFORMED = 'The release manifest is malformed. Nothing was installed.';
 const BAD_NAME = 'The release file name does not match its manifest. Nothing was installed.';
@@ -185,6 +185,7 @@ export function verifyRelease(signed, keys, wireEdition, env) {
         };
     }
     checkRequires(m, env);
+    const minUi = m.requires?.ui === undefined ? undefined : parseMinimum('ui', m.requires.ui);
     const { plugin, uis, notes } = interpretArtifacts(m);
     let ui = null;
     if (m.edition !== 'free') {
@@ -202,6 +203,7 @@ export function verifyRelease(signed, keys, wireEdition, env) {
         plugin: { file: plugin.file, sha256: plugin.sha256, size: plugin.size, files: { file: plugin.files.file, sha256: plugin.files.sha256, size: plugin.files.size } },
         ui,
         notes,
+        ...(minUi === undefined ? {} : { requiresUi: minUi.join('.') }),
     };
 }
 export function checkArchive(zip, m) {

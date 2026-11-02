@@ -11,10 +11,12 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { PLUGIN_VERSION_RE } from './content-manifest.js';
-import type { BeatAnswer } from './session-api.js';
+import { batchAfter, readAck, readLedgerDetailed, writeAck } from './activity-ledger.js';
+import { recordQuota } from './quota.js';
+import { type BeatAnswer, type BeatBody, LedgerRefusedError } from './session-api.js';
 import { beatFile, projectDirOf, readInstallId, readSessionId, readSessionTree, sessionKeyOf, startedFile } from './session-context.js';
 import type { SessionRunContext } from './session-runtime.js';
-import { readLocalState, readToken } from './state.js';
+import { readLocalState, readToken, type LocalStateV2 } from './state.js';
 import { MCP_VERSION } from './version.js';
 
 /** The beat interval when the server does not name one (contract §10). */
@@ -127,6 +129,30 @@ async function leash(ctx: SessionRunContext): Promise<void> {
 }
 
 /**
+ * The usage fields of the beat, for a Pro Budget account only (the server counts active time for no other plan): `ledger`
+ * when the features name it, else `activeSec` when they name that one, else nothing. `activeSec` moves the acknowledged
+ * head to the last line it counted, before the request is sent. A failure reading the ledger sends nothing.
+ */
+async function meterFields(ctx: SessionRunContext, local: LocalStateV2): Promise<Pick<BeatBody, 'activeSec' | 'ledger'>> {
+  const confirmed = local.lastConfirmed;
+  if (confirmed?.plan !== 'pro_budget') return {};
+  const features = confirmed.features ?? [];
+  try {
+    const { lines } = await readLedgerDetailed(ctx.paths.home);
+    const ackedHead = await readAck(ctx.paths.home);
+    if (features.includes('ledger')) return { ledger: batchAfter(lines, ackedHead) };
+    if (!features.includes('activeSec')) return {};
+    const { intervals } = batchAfter(lines, ackedHead, lines.length);
+    const activeSec = intervals.reduce((sum, line) => sum + (line.end - line.start), 0);
+    const last = intervals[intervals.length - 1];
+    if (last !== undefined) await writeAck(ctx.paths.home, last.hash, ctx.now());
+    return { activeSec };
+  } catch {
+    return {};
+  }
+}
+
+/**
  * One beat (contract §4, §8, §10). Skips without a request and without a file when the session id, the install id, the
  * device id or the Pro token is absent. Otherwise posts the beat and writes the beat file after the attempt, whatever
  * its outcome: on success lastOkAt is the attempt's time and intervalS the server's; on failure lastOkAt and intervalS
@@ -142,30 +168,40 @@ export async function beatOnce(ctx: SessionRunContext): Promise<BeatResult> {
   if (installId === null) return skip('no install id');
   const token = await readToken(ctx.paths);
   if (token === null) return skip('no Pro token');
-  const deviceId = (await readLocalState(ctx.paths)).deviceId;
+  const local = await readLocalState(ctx.paths);
+  const deviceId = local.deviceId;
   if (typeof deviceId !== 'string' || deviceId.length === 0) return skip('no device id');
 
-  const body = {
+  const body: BeatBody = {
     deviceId,
     installId,
     sessionKey: sessionKeyOf(sessionId),
     pluginVersion: await installedProVersion(ctx.paths.marketplace.pro.pluginDir),
+    ...(await meterFields(ctx, local)),
   };
   const file = beatFile(ctx.paths.home, sessionId);
   const at = ctx.now().toISOString();
 
   let answer: BeatAnswer | null;
+  let refusal: LedgerRefusedError | null = null;
   try {
     answer = await ctx.api.beat(token, body);
-  } catch {
+  } catch (err) {
     answer = null;
+    if (err instanceof LedgerRefusedError) refusal = err;
   }
 
-  if (answer !== null) {
-    const intervalS = Number.isFinite(answer.intervalS) && answer.intervalS > 0 ? answer.intervalS : BEAT_INTERVAL_S;
+  // A ledger refusal (422 ledger_broken) does not cut the session: the beat counts as ok and the acknowledged head does not move.
+  if (answer !== null || refusal !== null) {
+    const intervalS = answer !== null && Number.isFinite(answer.intervalS) && answer.intervalS > 0 ? answer.intervalS : BEAT_INTERVAL_S;
     missedBeats = 0;
     purgedThisStreak = false;
     await writeJsonAtomic(file, { pid: process.pid, at, lastOkAt: at, intervalS });
+    if (answer !== null) {
+      if (answer.ledger !== undefined) await writeAck(ctx.paths.home, answer.ledger.head, ctx.now());
+      await recordQuota(ctx.paths, answer.quota, ctx.now());
+    }
+    if (refusal !== null) ctx.log(refusal.index !== null ? `beat: ledger refused at line ${refusal.index}` : 'beat: ledger refused (the server named no line)');
     ctx.log('beat: ok');
     return { status: 'ok', text: 'ok', intervalS };
   }
@@ -186,7 +222,10 @@ export async function beatOnce(ctx: SessionRunContext): Promise<BeatResult> {
 /** The started marker (contract §8): {pid, at, version}, written once at start. */
 export async function writeStartedMarker(ctx: SessionRunContext): Promise<StartedResult> {
   const sessionId = sessionIdOf(ctx.env);
-  if (sessionId === null) return 'skip (no session id)';
+  if (sessionId === null) {
+    ctx.log('start: started marker skipped (CLAUDE_CODE_SESSION_ID is missing or not a usable id)');
+    return 'skip (no session id)';
+  }
   await writeJsonAtomic(startedFile(ctx.paths.home, sessionId), {
     pid: process.pid,
     at: ctx.now().toISOString(),

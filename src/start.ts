@@ -24,3 +24,19 @@ export function startMcp<T>({ serve, startCheck, defer = setImmediate, log }: St
   });
   return served;
 }
+
+export interface InstallArgs {
+  install: boolean;
+  yesShortcut: boolean;
+  noShortcut: boolean;
+}
+
+/** argv is process.argv; only entries from index 2 on are read. */
+export function parseInstallArgs(argv: readonly string[]): InstallArgs {
+  const args = argv.slice(2);
+  return {
+    install: args.includes('install'),
+    yesShortcut: args.includes('--yes-shortcut'),
+    noShortcut: args.includes('--no-shortcut'),
+  };
+}

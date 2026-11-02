@@ -1,8 +1,9 @@
 // cyphor-role: IO
 import { spawn } from 'node:child_process';
-import { mkdir, readdir, readFile, rename as fsRename, rm, stat } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, rename as fsRename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { writeFileAtomic } from './fsutil.js';
+import { readLocalState, withStateLock, writeLocalState } from './state.js';
 import { ReleaseVerificationError } from './release.js';
 import { safeExtract } from './unzip.js';
 /**
@@ -16,6 +17,8 @@ export const UI_ENTRY_BY_PLATFORM = {
 };
 /** The ruled S-4 cap per UI archive (C1 §2.5), the same one PhanOS-UI's release script enforces. */
 export const UI_CAP = { zipBytes: 256 * 1024 * 1024, unpackedBytes: 768 * 1024 * 1024, entries: 2_000 };
+/** C-UI1: the answer when the installed UI is older than the minimum the last installed release declared. */
+export const UI_OLDER_TEXT = 'This PhanOS UI is older than your PhanOS installation needs. Run phanos_update in Claude Code, or download and replace the current UI with the one on phanos.eu.';
 export function uiNotAvailableNote(platformKey) {
     return `The PhanOS UI is not available for this platform (${platformKey}); the plugin installs without it.`;
 }
@@ -24,6 +27,29 @@ export function assertSafeVersionTag(version) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(version) || version === 'current') {
         throw new Error(`Unsafe UI version tag: ${JSON.stringify(version)}. Nothing was installed.`);
     }
+}
+const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+/**
+ * True when version `a` is strictly newer than `b`: numeric per core segment, a prerelease ranks below its own
+ * core, two prereleases of one core compare by their tag text. Returns false when either side does not parse.
+ */
+export function isNewerVersion(a, b) {
+    const pa = VERSION_RE.exec(a);
+    const pb = VERSION_RE.exec(b);
+    if (!pa || !pb)
+        return false;
+    for (let i = 1; i <= 3; i++) {
+        const d = Number(pa[i]) - Number(pb[i]);
+        if (d !== 0)
+            return d > 0;
+    }
+    const preA = pa[4];
+    const preB = pb[4];
+    if (preA === undefined)
+        return preB !== undefined;
+    if (preB === undefined)
+        return false;
+    return preA.slice(1) > preB.slice(1);
 }
 async function readPointer(file) {
     try {
@@ -59,6 +85,16 @@ export async function installUi(opts) {
     if (zip === null)
         return { version: null, platform: platformKey, pruned: [], notes: [uiNotAvailableNote(platformKey)] };
     assertSafeVersionTag(version);
+    // The MCP never overwrites a newer UI the zip placed: a recorded newer version is kept, nothing is extracted or moved.
+    const recordedUi = (await readLocalState(paths)).ui?.version;
+    if (recordedUi && isNewerVersion(recordedUi, version)) {
+        return {
+            version: recordedUi,
+            platform: platformKey,
+            pruned: [],
+            notes: [`PhanOS UI ${recordedUi} is already installed and is newer than ${version} in this release, so it stays in place.`],
+        };
+    }
     if (zip.length > UI_CAP.zipBytes)
         throw new ReleaseVerificationError('The UI archive is too large. Nothing was installed.');
     const notes = [];
@@ -108,6 +144,66 @@ export async function installUi(opts) {
     }
     return { version, platform: platformKey, pruned, notes };
 }
+/** The answer the recorded version alone decides, or null when the bundle has to be installed. */
+function adoptAnswer(recorded, version) {
+    if (recorded === version)
+        return { current: version, action: 'already-current' };
+    if (recorded && isNewerVersion(recorded, version))
+        return { current: recorded, action: 'kept-newer' };
+    return null;
+}
+/**
+ * Adopts a UI bundle already on disk into `<home>/ui/<version>/` by version compare only: a recorded version equal
+ * to `version` is already current, a recorded newer one is kept (nothing copied or written). Otherwise the bundle is
+ * copied through staging, the `current` pointer moves, and state.json `ui` records it. Prunes nothing. The commit
+ * re-reads the recorded version under the state lock, so a newer record written since the early check is kept.
+ */
+export async function adoptUi(opts) {
+    const { paths, sourceDir, version, platformKey } = opts;
+    assertSafeVersionTag(version);
+    // Fast path: a recorded version that already decides the answer returns before any copy.
+    const early = adoptAnswer((await readLocalState(paths)).ui?.version, version);
+    if (early)
+        return early;
+    const target = join(paths.uiDir, version);
+    let staging = null;
+    const discard = async () => {
+        if (staging !== null)
+            await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+        staging = null;
+    };
+    try {
+        if (!(await exists(target))) {
+            const stage = join(paths.stagingDir, `ui-${version}-${process.pid}-${Date.now()}`);
+            staging = stage;
+            await mkdir(paths.stagingDir, { recursive: true });
+            await cp(sourceDir, stage, { recursive: true });
+        }
+        await opts.beforeCommit?.();
+        // The commit re-reads the recorded version under the state lock, so a newer record written since the check is kept.
+        const result = await withStateLock(paths, async () => {
+            const answer = adoptAnswer((await readLocalState(paths)).ui?.version, version);
+            if (answer)
+                return answer;
+            if (staging !== null) {
+                await mkdir(paths.uiDir, { recursive: true });
+                await fsRename(staging, target);
+                staging = null;
+            }
+            // The version folder is complete; only now does the pointer move, then state.json records it.
+            await writeFileAtomic(paths.uiCurrentFile, version);
+            const s = await readLocalState(paths);
+            await writeLocalState(paths, { ...s, ui: { version, platform: platformKey } });
+            return { current: version, action: 'installed' };
+        });
+        await discard();
+        return result;
+    }
+    catch (e) {
+        await discard();
+        throw e;
+    }
+}
 /** Starts the UI detached from the MCP process; resolves once the process exists, rejects if it could not start. */
 export function launchDetached(entry, cwd) {
     return new Promise((resolve, reject) => {
@@ -122,7 +218,11 @@ export function launchDetached(entry, cwd) {
 const RUN_INSTALL = 'Run phanos_install to install it.';
 /** The Basic answer of the UI tool (F-9996): the single source, so the service never duplicates the text. */
 export function uiComesWithProText(apiBase) {
-    return `The PhanOS UI comes with Pro: ${apiBase.replace(/\/+$/, '')}/pricing`;
+    return `The PhanOS UI is on your account page: ${apiBase.replace(/\/+$/, '')}/account. Without a paid plan it opens in PhanOS Basic.`;
+}
+/** The Pro answer when no UI is installed: phanos_update, or the download on the account page. */
+function notInstalledText(apiBase) {
+    return `The PhanOS UI is not installed. Run phanos_update to install it, or download it from your account page: ${apiBase.replace(/\/+$/, '')}/account`;
 }
 async function isFile(path) {
     try {
@@ -134,8 +234,8 @@ async function isFile(path) {
 }
 /**
  * The `phanos_ui` answer (M9a): an installed UI is started detached whatever the account state (an ended
- * account sees the renew screen inside the UI). Without one: Basic gets the pricing address, a platform
- * with no build is told so, anyone else is sent to `phanos_install`. A pointer that names a missing folder
+ * account sees the renew screen inside the UI). Without one: Basic gets the account-page address, a platform
+ * with no build is told so, anyone else is sent to phanos_update or the account page. A pointer that names a missing folder
  * is reported and never launched; the pointer's version is checked as a path segment before it is joined.
  */
 export async function uiToolAnswer(opts) {
@@ -151,6 +251,10 @@ export async function uiToolAnswer(opts) {
         catch {
             return notLaunched(`The PhanOS UI pointer holds an unusable version (${JSON.stringify(pointer)}); it was not started. ${RUN_INSTALL}`);
         }
+        // A UI below the minimum the last installed release declared is refused, never launched.
+        const minimum = state.ui?.requires;
+        if (typeof minimum === 'string' && isNewerVersion(minimum, pointer))
+            return notLaunched(UI_OLDER_TEXT);
         const folder = join(paths.uiDir, pointer);
         if (entryName !== undefined) {
             const entry = join(folder, entryName);
@@ -171,5 +275,5 @@ export async function uiToolAnswer(opts) {
         return notLaunched(uiComesWithProText(apiBase));
     if (entryName === undefined)
         return notLaunched(`The PhanOS UI is not available for this platform yet (${platformKey}).`);
-    return notLaunched(`The PhanOS UI is not installed. ${RUN_INSTALL}`);
+    return notLaunched(notInstalledText(apiBase));
 }

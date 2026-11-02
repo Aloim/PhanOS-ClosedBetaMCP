@@ -60,6 +60,12 @@ export interface FlipResult {
   /** The last listing read, or null when none was read or it was unparsable. */
   listing: Listing | null;
   /**
+   * The edition the plan targeted (`FlipPlan.target`): the one the flip settled on when `settled` is true. Null when the
+   * plan decided nothing (an unknown answer, an unreadable listing). Callers take the target from here, never from the
+   * account answer, since an exhausted Pro Budget account flips to Basic although its answer state is `active`.
+   */
+  target: LocalEdition | null;
+  /**
    * After the plan ran, the listing read last confirms the target state of the trigger (the target edition enabled,
    * the other disabled or absent), whether by actions now (`changed`) or because it already held. False when nothing
    * could be confirmed: no or unparsable listing, target edition not on disk or not registered, an unknown account
@@ -151,7 +157,7 @@ export function decideFlip(input: DecideInput): FlipPlan {
     return make(null, [], lines);
   }
 
-  const target: LocalEdition = trigger === 'logout' ? 'basic' : answer !== null && answer.kind === 'known' && ENTITLED.has(answer.state) ? 'pro' : 'basic';
+  const target: LocalEdition = trigger === 'logout' ? 'basic' : answer !== null && answer.kind === 'known' && ENTITLED.has(answer.state) && answer.me.quota?.exhausted !== true ? 'pro' : 'basic';
   const o = other(target);
   const notices = listing[PLUGIN_IDS[o]]?.projectEnabled ? [projectNotice(o)] : [];
 
@@ -334,7 +340,7 @@ async function runFlipActions(plan: FlipPlan, run: ClaudeRunner, ctx: FlipContex
     listing = out.listing;
     if (!out.ok) {
       const lines = [...(out.lines ?? []), ...plan.lines];
-      return { ok: false, changed, answer: lines.join('\n'), lines, failed: action, listing, settled: false };
+      return { ok: false, changed, answer: lines.join('\n'), lines, failed: action, listing, target: plan.target, settled: false };
     }
     if (action.kind !== 'renew-token') changed = true;
   }
@@ -345,7 +351,7 @@ async function runFlipActions(plan: FlipPlan, run: ClaudeRunner, ctx: FlipContex
     plan.actions.length === 0
       ? plan.holds
       : plan.target !== null && listing !== null && userOn(listing[PLUGIN_IDS[plan.target]]) && !userOn(listing[PLUGIN_IDS[other(plan.target)]]);
-  return { ok: true, changed, answer: lines.join('\n'), lines, listing, settled };
+  return { ok: true, changed, answer: lines.join('\n'), lines, listing, target: plan.target, settled };
 }
 
 export interface ReconcileInput {

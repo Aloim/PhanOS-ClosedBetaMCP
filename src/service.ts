@@ -8,11 +8,13 @@ import { ACCOUNT_STATES, ApiError, fetchKillSwitch, readAccount, type AccountRea
 import { listPlugins, manualCommand, manualInstallCommands, type ClaudeRunner } from './claude-cli.js';
 import { PLUGIN_IDS, toWire, type LocalEdition, type Paths } from './config.js';
 import { contentStatusLines, loadContent, reconcileContentCache, refreshContent, type ContentDeps, type ContentInput } from './content.js';
+import { pollDeviceFlow } from './device-flow.js';
 import { sendFeedback } from './feedback.js';
 import { parseFilesList } from './files-list.js';
 import { executeInstallRegistration, nextSessionLine, reconcileEditions, treesOnDisk, type FlipResult } from './flip.js';
 import { checkLiveTree, FilesInUseError, installPluginTree, LocalChangesError, OVERWRITE_ALL_REFUSED, UncheckableTreeError, utcStamp, type InstallResult, type InstallUpdate } from './install.js';
 import { pruneProjectPointers } from './pointer-prune.js';
+import { quotaLine, recordQuota } from './quota.js';
 import { checkPrerequisites, type CommandRunnerFactory } from './prereqs.js';
 import { ACCEPT_SCHEMA_1, checkArchive, ReleaseVerificationError, verifyRelease, type ReleaseEnv, type VerifiedRelease } from './release.js';
 import type { SecretStore } from './secrets.js';
@@ -23,6 +25,7 @@ import { deleteToken, maxServerTime, readLocalState, readToken, recordLaunch, St
 import { applyShortcutAfterSwitch, runSwitch, type SwitchAnswer } from './switch-runner.js';
 import type { TrustedKey } from './trusted-keys.js';
 import { installUi, uiComesWithProText, uiToolAnswer } from './ui.js';
+import { uiUpdateNeeded } from './ui-update.js';
 import { MCP_VERSION } from './version.js';
 
 export class UserError extends Error {}
@@ -87,7 +90,7 @@ const REFRESH_BEFORE_MS = 3 * 86_400_000;
 const NEEDS_LOGIN = 'Every PhanOS install needs a signed-in account; run phanos_login';
 const LABEL: Record<LocalEdition, string> = { pro: 'Pro', basic: 'Basic' };
 const ENTITLED = new Set<string>(['active', 'trial', 'grace']);
-const planName = (p: Me['plan']) => ({ free: 'Free', pro: 'Pro', business: 'Business' })[p];
+const planName = (p: Me['plan']) => ({ free: 'Free', pro: 'Pro', business: 'Business', pro_budget: 'Pro Budget' })[p];
 const day = (iso: string | Date) => new Date(iso).toISOString().slice(0, 10);
 const planLabel = (me: Me) => `${planName(me.plan)}${me.until && me.plan !== 'free' ? ` until ${day(me.until)}` : ''}`;
 const sha256 = (b: Buffer): string => createHash('sha256').update(b).digest('hex');
@@ -135,7 +138,7 @@ function insertBeforeNextSession(answer: string, line: string): string {
 
 /** C1 section 4: `active`, `trial` and `grace` keep Pro; `ended` and `never` are Basic. An older server without `state` falls back to the plan. */
 function isEntitled(me: Me): boolean {
-  if (typeof me.state === 'string' && (ACCOUNT_STATES as readonly string[]).includes(me.state)) return ENTITLED.has(me.state);
+  if (typeof me.state === 'string' && (ACCOUNT_STATES as readonly string[]).includes(me.state)) return ENTITLED.has(me.state) && me.quota?.exhausted !== true;
   return me.plan !== 'free';
 }
 
@@ -265,54 +268,74 @@ export function createPhanosService(d: ServiceDeps) {
     return null;
   }
 
-  async function startLogin(): Promise<string> {
+  /** The public `install` pass: one job in the serial queue, under the state lock (the `install` property and the sign-in share it). */
+  const installPass = (force: boolean): Promise<string> => serial(() => locked('install', () => install(force), () => BUSY_INSTALL));
+
+  /** WB2.08: with `install`, the sign-in task runs the install after the login lock has returned, and the call waits for both inside the login budget. */
+  async function startLogin(opts?: { install?: boolean }): Promise<string> {
     if (login.status === 'pending') return pendingText(login);
     const flow = await d.api.startDeviceFlow();
     login = { status: 'pending', userCode: flow.userCode, url: flow.verificationUriComplete };
     task = (async () => {
-      let interval = flow.interval;
-      const deadline = d.now().getTime() + flow.expiresIn * 1000;
-      for (;;) {
-        await d.sleep(interval * 1000);
-        if (d.now().getTime() > deadline) break;
-        const r = await d.api.pollDeviceToken(flow.deviceCode);
-        if (r.status === 'pending') continue;
-        if (r.status === 'slow_down') {
-          interval += 5;
-          continue;
-        }
-        if (r.status === 'denied') {
-          login = { status: 'failed', message: 'Sign-in was refused in the browser. Run phanos_login to try again.' };
-          return;
-        }
-        if (r.status === 'expired') break;
-        await d.secrets.set(r.accessToken);
-        const me = await d.api.me(r.accessToken);
-        // F-16076 C3: the email write and the token fetch hold state.json.lock; a busy lock leaves the token for a later status.
-        let note = '';
-        await locked(
-          'login',
-          async () => {
-            await writeLocalState(d.paths, { ...(await readLocalState(d.paths)), email: me.email });
-            try {
-              await ensureToken(r.accessToken, me);
-            } catch (e) {
-              note = ` ${(e as Error).message}`;
-            }
-          },
-          () => {
-            note = ` ${BUSY_LOGIN}`;
-          },
-        );
-        login ={ status: 'done', message: `Signed in as ${me.email} (plan ${planLabel(me)}).${note}` };
+      const outcome = await pollDeviceFlow({ api: d.api, sleep: d.sleep, now: d.now }, flow);
+      if (outcome.status === 'denied') {
+        login = { status: 'failed', message: 'Sign-in was refused in the browser. Run phanos_login to try again.' };
         return;
       }
-      login = { status: 'failed', message: 'The sign-in code expired. Run phanos_login again.' };
+      if (outcome.status === 'expired') {
+        login = { status: 'failed', message: 'The sign-in code expired. Run phanos_login again.' };
+        return;
+      }
+      const accessToken = outcome.accessToken;
+      await d.secrets.set(accessToken);
+      const me = await d.api.me(accessToken);
+      // F-16076 C3: the email write and the token fetch hold state.json.lock; a busy lock leaves the token for a later status.
+      let note = '';
+      await locked(
+        'login',
+        async () => {
+          await writeLocalState(d.paths, { ...(await readLocalState(d.paths)), email: me.email });
+          try {
+            await ensureToken(accessToken, me);
+          } catch (e) {
+            note = ` ${(e as Error).message}`;
+          }
+        },
+        () => {
+          note = ` ${BUSY_LOGIN}`;
+        },
+      );
+      let message = `Signed in as ${me.email} (plan ${planLabel(me)}).${note}`;
+      if (opts?.install) {
+        // WB2.08: the install runs outside the login lock; its answer, or the error it threw, follows the signed-in text.
+        try {
+          message = `${message}\n${await installPass(false)}`;
+        } catch (e) {
+          message = `${message}\n${(e as Error).message}`;
+        }
+      }
+      login = { status: 'done', message };
+      return;
     })().catch((e: Error) => {
       login = { status: 'failed', message: `Sign-in failed: ${e.message}` };
     });
+    if (!opts?.install) return pendingText(login);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, lockWait('login'));
+    });
+    await Promise.race([task, budget]);
+    clearTimeout(timer);
+    const finished = finishedLoginText();
+    if (finished !== null) {
+      login = { status: 'idle' };
+      return finished;
+    }
     return pendingText(login);
   }
+
+  /** The sign-in's finished answer (done or failed), or null while it still waits for the user. */
+  const finishedLoginText = (): string | null => (login.status === 'done' || login.status === 'failed' ? login.message : null);
 
   const installedLine = (state: LocalStateV2): string => {
     const parts = (['pro', 'basic'] as const).filter((e) => state[e]?.version).map((e) => `${LABEL[e]} ${state[e]!.version}`);
@@ -406,9 +429,10 @@ export function createPhanosService(d: ServiceDeps) {
     edit?.(next, prior);
     if (answer.kind === 'known') {
       if (flip.ok && flip.changed) next.enabled = isEntitled(answer.me) ? 'pro' : 'basic';
-      next.lastConfirmed = { state: answer.state, at: d.now().toISOString() };
+      next.lastConfirmed = { state: answer.state, at: d.now().toISOString(), plan: answer.me.plan, ...(answer.me.features === undefined ? {} : { features: answer.me.features }) };
     }
     if (JSON.stringify(next) !== JSON.stringify(prior)) await writeLocalState(d.paths, next);
+    if (answer.kind === 'known') await recordQuota(d.paths, answer.me.quota, d.now());
   }
 
   /**
@@ -457,7 +481,9 @@ export function createPhanosService(d: ServiceDeps) {
     try {
       const state = answer.kind === 'known' ? answer.state : null;
       const switchAnswer: SwitchAnswer = state === 'ended' || state === 'never' ? state : state !== null && ENTITLED.has(state) ? 'entitled' : 'unknown';
-      const target = switchAnswer === 'entitled' ? 'pro' : switchAnswer === 'unknown' ? null : 'basic';
+      // F-23901: the target is the edition this flip settled on, not the answer's state. An exhausted Pro Budget account is
+      // `entitled` yet its flip targets Basic, so it must not open the reenable gate.
+      const target = flip.target;
       // The kill switch is read only where a downgrade can happen (the runner's trigger gate, rule 5), so an ordinary entitled
       // pass makes no extra manifest request; a failed read is `unread` (C-10).
       const downgrade = (switchAnswer === 'ended' || switchAnswer === 'never') && flip.settled && target === 'basic';
@@ -508,6 +534,7 @@ export function createPhanosService(d: ServiceDeps) {
       if (answer.kind === 'known') lastOk = d.now().toISOString();
       if (answer.kind === 'known') {
         lines.push(`Account ${answer.me.email}, plan ${planLabel(answer.me)}. Credential stored in ${d.secrets.where}.`);
+        if (answer.me.plan === 'pro_budget' && answer.me.quota) lines.push(quotaLine(answer.me.quota));
         if (full) {
           const token = await ensureToken(session, answer.me).catch((e: Error) => {
             lines.push(e.message);
@@ -606,7 +633,7 @@ export function createPhanosService(d: ServiceDeps) {
   /** Is the Pro UI of this release missing or at another version (the state record, the `ui/current` pointer and its folder all agree)? */
   async function uiBehind(release: VerifiedRelease, state: LocalStateV2): Promise<boolean> {
     if (!release.ui) return false;
-    if (state.ui?.version !== release.version || state.ui.platform !== release.ui.platform) return true;
+    if (uiUpdateNeeded(state, release)) return true;
     try {
       if ((await readFile(d.paths.uiCurrentFile, 'utf8')).trim() !== release.version) return true;
       await readdir(join(d.paths.uiDir, release.version));
@@ -765,17 +792,19 @@ export function createPhanosService(d: ServiceDeps) {
    * record stays unchanged, so the next update tries the UI again. An account that is not entitled never gets a Pro
    * `Prepared`, so its existing UI is left alone.
    */
-  async function installUiAfterFlip(prepared: readonly Prepared[]): Promise<{ lines: string[]; ui?: { version: string; platform: string } }> {
+  async function installUiAfterFlip(prepared: readonly Prepared[]): Promise<{ lines: string[]; ui?: { version: string; platform: string; requires?: string } }> {
     const p = prepared.find((x) => x.edition === 'pro' && x.uiZip && x.release.ui);
     if (!p?.uiZip || !p.release.ui) return { lines: [] };
     const version = p.release.version;
     const platform = p.release.ui.platform;
     try {
       const r = await installUi({ paths: d.paths, version, platformKey: platform, zip: p.uiZip });
+      // A kept newer UI (r.version differs) prints only its own note: no 'installed' line for a version that was not installed.
+      const kept = r.version !== version;
       const already = r.notes.find((n) => n.includes('was already installed'));
-      const lines = already ? [already] : [`PhanOS UI ${version} installed (signature and checksums verified).`];
+      const lines = kept ? [] : already ? [already] : [`PhanOS UI ${version} installed (signature and checksums verified).`];
       lines.push(...r.notes.filter((n) => n !== already));
-      return { lines, ui: { version, platform } };
+      return { lines, ui: { version: r.version ?? version, platform, ...(p.release.requiresUi !== undefined ? { requires: p.release.requiresUi } : {}) } };
     } catch (e) {
       return { lines: [`PhanOS UI ${version} could not be installed (${(e as Error).message}). The plugin is installed; run phanos_update to try the UI again.`] };
     }
@@ -827,7 +856,7 @@ export function createPhanosService(d: ServiceDeps) {
     }
     // A missing `claude` cannot register or flip anything: the trees stay written and the answer ends with the manual commands.
     const flip: FlipResult = claudeMissing
-      ? { ok: false, changed: false, answer: manualRegistration(editions), lines: [], listing: null, settled: false }
+      ? { ok: false, changed: false, answer: manualRegistration(editions), lines: [], listing: null, target: null, settled: false }
       : await reconcileEditions({
           trigger: 'install',
           answer,
@@ -1107,7 +1136,7 @@ export function createPhanosService(d: ServiceDeps) {
     /** F-16076 C6: bounded in its queue and its lock wait; the degraded answer ends with BUSY_STATUS. */
     status: boundedStatus,
     /** `force` (M7b, WE-5.01 ruling 9): overwrite_all for the install, a copy of each replaced file kept aside; no argument means `force: false`. */
-    install: (opts?: { force?: boolean }) => serial(() => locked('install', () => install(opts?.force === true), () => BUSY_INSTALL)),
+    install: (opts?: { force?: boolean }) => installPass(opts?.force === true),
     /** P-3 (section 8): `corpus: "refresh"` runs the content refresh alone; like `content` it is outside `serial` and the state lock, the cache having its own lock. */
     update: (opts?: UpdateOptions) =>
       opts?.corpus === 'refresh' ? refreshContent(contentDeps(), d.trustedKeys) : serial(() => locked('update', () => updateAnswer(opts ?? {}), () => BUSY_UPDATE)),

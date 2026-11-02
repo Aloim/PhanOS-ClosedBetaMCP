@@ -3,10 +3,22 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdir, open, readFile, rm, unlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { readJsonOr, writeFileAtomic } from './fsutil.js';
+/** The state file schema this build reads and writes (C1 §5.1). */
+export const STATE_SCHEMA = 2;
+/** The refusal text a writer throws over a state file of a newer schema (C-UI1). */
+export const STATE_SCHEMA_NEWER_MESSAGE = 'This PhanOS UI is older than your PhanOS installation needs. Update the PhanOS MCP.';
+/** Thrown by writeLocalState when the file on disk carries a schema above STATE_SCHEMA; the file is left unchanged. */
+export class StateSchemaNewerError extends Error {
+    code = 'state_schema_newer';
+    constructor(message = STATE_SCHEMA_NEWER_MESSAGE) {
+        super(message);
+        this.name = 'StateSchemaNewerError';
+    }
+}
 const isRecord = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const SCHEMA1_KEYS = new Set(['edition', 'installedVersion', 'registeredWithClaude']);
 function upgradeSchema1(raw) {
-    const out = { schema: 2 };
+    const out = { schema: STATE_SCHEMA };
     for (const [k, v] of Object.entries(raw))
         if (!SCHEMA1_KEYS.has(k) && k !== 'schema')
             out[k] = v;
@@ -29,16 +41,32 @@ export async function readLocalState(p) {
         raw = await readJsonOr(p.stateFile, {});
     }
     catch {
-        return { schema: 2 };
+        return { schema: STATE_SCHEMA };
     }
     if (!isRecord(raw))
-        return { schema: 2 };
+        return { schema: STATE_SCHEMA };
     if (raw.schema === undefined || raw.schema === 1)
         return upgradeSchema1(raw);
     return raw;
 }
+/** Reads the schema of the state file on disk without reshaping it. `newer` is true when its numeric schema is above STATE_SCHEMA. Corrupt or missing reads as not newer. */
+export async function readStateGuard(p) {
+    let raw;
+    try {
+        raw = await readJsonOr(p.stateFile, {});
+    }
+    catch {
+        return { newer: false };
+    }
+    if (!isRecord(raw) || typeof raw.schema !== 'number')
+        return { newer: false };
+    return { newer: raw.schema > STATE_SCHEMA, schema: raw.schema };
+}
+/** Writes the state file as STATE_SCHEMA. Throws StateSchemaNewerError, leaving the file unchanged, when the file on disk has a newer schema. */
 export async function writeLocalState(p, s) {
-    const clean = Object.fromEntries(Object.entries({ ...s, schema: 2 }).filter(([, v]) => v !== undefined));
+    if ((await readStateGuard(p)).newer)
+        throw new StateSchemaNewerError();
+    const clean = Object.fromEntries(Object.entries({ ...s, schema: STATE_SCHEMA }).filter(([, v]) => v !== undefined));
     await writeFileAtomic(p.stateFile, `${JSON.stringify(clean, null, 2)}\n`, 0o600);
 }
 const finiteOrUndefined = (v) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;

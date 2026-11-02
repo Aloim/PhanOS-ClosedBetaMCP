@@ -42,8 +42,8 @@ export function buildServer(svc: PhanosService, version: string, opts: { only?: 
   if (wanted('phanos_login')) {
     server.registerTool(
       'phanos_login',
-      { description: 'Sign in to your PhanOS account from this computer. Shows a code to confirm in the browser; no password is typed here. Every install needs a signed-in account, PhanOS Basic included.', inputSchema: z.object({}) },
-      () => runTool(() => svc.login()),
+      { description: 'Sign in to your PhanOS account from this computer. Shows a code to confirm in the browser; no password is typed here. Every install needs a signed-in account, PhanOS Basic included.', inputSchema: z.object({ install: z.boolean().optional().describe('After sign-in, install PhanOS right away') }) },
+      (args) => runTool(() => svc.login(args)),
     );
   }
   if (wanted('phanos_status')) {

@@ -1,13 +1,27 @@
 // cyphor-role: CORE
 // S5-2.01: the session HTTP client (entitlement sessions, coordination batch and view). Mirrors api.ts: 30 s timeout, ApiError mapping.
-import { ApiError } from './api.js';
+import { ApiError, type Quota } from './api.js';
+import type { LedgerLine } from './activity-ledger.js';
 
-/** `POST /api/entitlement/sessions/beat` body. `pluginVersion` is null when the caller does not know it. */
+/**
+ * `POST /api/entitlement/sessions/beat` body. `pluginVersion` is null when the caller does not know it. `activeSec` (seconds the
+ * meter closed since the last beat) and `ledger` (the lines after the acknowledged head) are sent only to a Pro Budget account
+ * whose features name them.
+ */
 export interface BeatBody {
   deviceId: string;
   installId: string;
   sessionKey: string;
   pluginVersion: string | null;
+  activeSec?: number;
+  ledger?: { from: string; intervals: LedgerLine[] };
+}
+
+/** A 422 `ledger_broken` refusal of the beat route; `index` is the body's numeric `index` (the refused line), null when it carries none. */
+export class LedgerRefusedError extends ApiError {
+  constructor(readonly index: number | null) {
+    super(422, 'ledger_broken', 'The server refused the activity ledger.');
+  }
 }
 
 /** `POST /api/entitlement/sessions/end` body. */
@@ -25,11 +39,13 @@ export interface CoordBatchBody {
   records: unknown[];
 }
 
-/** 200 of the beat route: the server's pacing, in seconds, and its clock. */
+/** 200 of the beat route: the server's pacing, in seconds, its clock, the Pro Budget quota when the account has one, and the ledger head it applied. */
 export interface BeatAnswer {
   intervalS: number;
   graceS: number;
   serverTime: number;
+  quota?: Quota;
+  ledger?: { head: string; applied: number };
 }
 
 /**
@@ -96,7 +112,15 @@ export class HttpSessionApi implements SessionApi {
 
   async beat(token: string, body: BeatBody): Promise<BeatAnswer> {
     const res = await this.send('POST', '/api/entitlement/sessions/beat', token, body);
-    if (!res.ok) throw await this.refusal(res);
+    if (!res.ok) {
+      if (res.status === 422) {
+        const probe = await this.jsonBody(res.clone());
+        if (probe.error === 'ledger_broken') {
+          throw new LedgerRefusedError(typeof probe.index === 'number' && Number.isFinite(probe.index) ? probe.index : null);
+        }
+      }
+      throw await this.refusal(res);
+    }
     return (await res.json()) as BeatAnswer;
   }
 

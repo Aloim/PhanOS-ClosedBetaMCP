@@ -1,6 +1,7 @@
 // cyphor-role: IO
 import { execFile } from 'node:child_process';
 import { PLUGIN_IDS } from './config.js';
+import { MCP_VERSION } from './version.js';
 
 /** `timeoutMs` bounds one run (default 120 s); a probe passes 10 s. */
 export type ClaudeRunner = (args: string[], opts?: { timeoutMs?: number }) => Promise<{ code: number; stdout: string; stderr: string }>;
@@ -134,4 +135,54 @@ export async function uninstallPlugin(run: ClaudeRunner, id: string): Promise<Cl
 
 export async function removeMarketplace(run: ClaudeRunner, name: string): Promise<CliResult> {
   return call(run, ['plugin', 'marketplace', 'remove', name]);
+}
+
+// ---------------------------------------------------------------------------
+// User-scope MCP registration (WB2.07, plan C-W1). The pinned command carries the package
+// version as its tag, so a package upgrade re-registers the server.
+// ---------------------------------------------------------------------------
+
+export const MCP_TAG = `v${MCP_VERSION}`;
+export const MCP_ADD_ARGS = (tag: string): string[] => ['mcp', 'add', '--scope', 'user', 'phanos', '--', 'npx', '-y', `github:Aloim/PhanOS-ClosedBetaMCP#${tag}`];
+export const MCP_ADD_COMMAND: string = 'claude ' + MCP_ADD_ARGS(MCP_TAG).join(' ');
+
+/** `present` is exit 0; `raw` is stdout, or stderr when stdout is empty (a not-found reply lands on stderr). */
+export async function getMcpServer(run: ClaudeRunner, name: string): Promise<{ present: boolean; raw: string }> {
+  const r = await call(run, ['mcp', 'get', name]);
+  return { present: r.code === 0, raw: r.stdout !== '' ? r.stdout : r.stderr };
+}
+
+export async function addMcpServer(run: ClaudeRunner, args: string[]): Promise<CliResult> {
+  return call(run, args);
+}
+
+export async function removeMcpServer(run: ClaudeRunner, name: string): Promise<CliResult> {
+  return call(run, ['mcp', 'remove', name, '--scope', 'user']);
+}
+
+/** A failed `claude mcp add`; `code` is the stable machine tag the caller branches on. */
+export class McpAddError extends Error {
+  readonly code = 'mcp_add_failed' as const;
+}
+
+/** True when `raw` pins the package to `tag` with the tag ending at a boundary: `v0.3.1` does not match `v0.3.12`. */
+const pinnedTo = (raw: string, tag: string): boolean =>
+  new RegExp(`github:Aloim/PhanOS-ClosedBetaMCP#${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![0-9A-Za-z.\\-_])`).test(raw);
+
+/**
+ * Registers the `phanos` MCP server at user scope. 'already' when the registered command already
+ * carries the pinned tag (no add); 'replaced' when another command is registered (remove, then add);
+ * 'added' when absent. Throws McpAddError when the add exits non-zero or `claude` cannot run.
+ */
+export async function registerMcp(opts: { scope: 'user'; run?: ClaudeRunner }): Promise<'added' | 'already' | 'replaced'> {
+  const run = opts.run ?? createClaudeRunner();
+  const current = await getMcpServer(run, 'phanos');
+  if (current.present && pinnedTo(current.raw, MCP_TAG)) return 'already';
+  if (current.present) await removeMcpServer(run, 'phanos');
+  const add = await addMcpServer(run, MCP_ADD_ARGS(MCP_TAG));
+  if (add.code !== 0) {
+    const detail = add.stderr.trim() || `claude mcp add stopped with exit code ${add.code}`;
+    throw new McpAddError(`Could not add the PhanOS MCP server to Claude Code (${detail}). To add it by hand, run: ${MCP_ADD_COMMAND}`);
+  }
+  return current.present ? 'replaced' : 'added';
 }

@@ -9,15 +9,22 @@ Claude Code.
 
 ## Install
 
-You need Node.js 22.12 or newer and Git.
+You need Node.js 22.12 or newer, Git and Claude Code. Every install signs in with your PhanOS account.
 
-    claude mcp add phanos -- npx -y github:Aloim/PhanOS-ClosedBetaMCP
+The one-command install, in a terminal:
 
-For a careful install, pin the version instead:
+    npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.1 install
 
-    claude mcp add phanos -- npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.0
+It signs you in through your browser (check the code, then choose Connect this device), checks the package
+signature before any file is written, installs PhanOS, registers this server with Claude Code at user scope and
+asks whether to put a PhanOS UI shortcut on your desktop (`--yes-shortcut` or `--no-shortcut` answers in advance).
+It ends with the line "Start a new Claude Code session in your project folder, then run /phanos:install."
 
-Every install signs in with your PhanOS account. Then ask Claude to run:
+Or add the server to Claude Code yourself:
+
+    claude mcp add --scope user phanos -- npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.1
+
+then ask Claude to run `phanos_login` with `install` (sign-in, then the install), or the tools one by one:
 - `phanos_login` — confirm the code in your browser
 - `phanos_install` — installs PhanOS Pro when your plan includes it, otherwise PhanOS Basic (`force` replaces files you changed by hand)
 - `phanos_status` — sign-in state, plan, token validity and the installed version
@@ -26,7 +33,7 @@ Every install signs in with your PhanOS account. Then ask Claude to run:
 - `phanos_ui` (`shortcut: create|remove`) — starts the PhanOS desktop UI; the shortcut is written only on request
 - `phanos_feedback` - sends a feedback or bug report to the PhanOS team, linked to your account (see "Sending feedback")
 
-An install, update or edition change ends with the line "Start a new Claude Code session to use
+Inside Claude Code, an install, update or edition change ends with the line "Start a new Claude Code session to use
 PhanOS <Pro|Basic>." Start that session to pick the change up.
 
 Every package is checked against PhanOS's offline signing key before any file is written.

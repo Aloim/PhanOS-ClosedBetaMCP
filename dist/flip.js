@@ -63,7 +63,7 @@ export function decideFlip(input) {
         }
         return make(null, [], lines);
     }
-    const target = trigger === 'logout' ? 'basic' : answer !== null && answer.kind === 'known' && ENTITLED.has(answer.state) ? 'pro' : 'basic';
+    const target = trigger === 'logout' ? 'basic' : answer !== null && answer.kind === 'known' && ENTITLED.has(answer.state) && answer.me.quota?.exhausted !== true ? 'pro' : 'basic';
     const o = other(target);
     const notices = listing[PLUGIN_IDS[o]]?.projectEnabled ? [projectNotice(o)] : [];
     if (trigger === 'install') {
@@ -234,7 +234,7 @@ async function runFlipActions(plan, run, ctx) {
         listing = out.listing;
         if (!out.ok) {
             const lines = [...(out.lines ?? []), ...plan.lines];
-            return { ok: false, changed, answer: lines.join('\n'), lines, failed: action, listing, settled: false };
+            return { ok: false, changed, answer: lines.join('\n'), lines, failed: action, listing, target: plan.target, settled: false };
         }
         if (action.kind !== 'renew-token')
             changed = true;
@@ -246,7 +246,7 @@ async function runFlipActions(plan, run, ctx) {
     const settled = plan.actions.length === 0
         ? plan.holds
         : plan.target !== null && listing !== null && userOn(listing[PLUGIN_IDS[plan.target]]) && !userOn(listing[PLUGIN_IDS[other(plan.target)]]);
-    return { ok: true, changed, answer: lines.join('\n'), lines, listing, settled };
+    return { ok: true, changed, answer: lines.join('\n'), lines, listing, target: plan.target, settled };
 }
 /** Reads the listing, decides, executes: the one call a trigger (install, start, status, update, logout) makes. */
 export async function reconcileEditions(input) {

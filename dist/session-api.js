@@ -1,6 +1,14 @@
 // cyphor-role: CORE
 // S5-2.01: the session HTTP client (entitlement sessions, coordination batch and view). Mirrors api.ts: 30 s timeout, ApiError mapping.
 import { ApiError } from './api.js';
+/** A 422 `ledger_broken` refusal of the beat route; `index` is the body's numeric `index` (the refused line), null when it carries none. */
+export class LedgerRefusedError extends ApiError {
+    index;
+    constructor(index) {
+        super(422, 'ledger_broken', 'The server refused the activity ledger.');
+        this.index = index;
+    }
+}
 export class HttpSessionApi {
     base;
     fetchImpl;
@@ -37,8 +45,15 @@ export class HttpSessionApi {
     }
     async beat(token, body) {
         const res = await this.send('POST', '/api/entitlement/sessions/beat', token, body);
-        if (!res.ok)
+        if (!res.ok) {
+            if (res.status === 422) {
+                const probe = await this.jsonBody(res.clone());
+                if (probe.error === 'ledger_broken') {
+                    throw new LedgerRefusedError(typeof probe.index === 'number' && Number.isFinite(probe.index) ? probe.index : null);
+                }
+            }
             throw await this.refusal(res);
+        }
         return (await res.json());
     }
     async end(token, body) {

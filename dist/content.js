@@ -12,8 +12,8 @@ import { ContentVerificationError, PLUGIN_VERSION_RE, contentNameProblem, isCont
 import { readLocalState, readToken, StateLockBusyError, tokenExpiry } from './state.js';
 import { TRUSTED_RELEASE_KEYS } from './trusted-keys.js';
 import { MCP_VERSION } from './version.js';
-/** PROVISIONAL (03_c9-wire-client.md section 6): the Pro plugin versions this MCP serves text to, `min <= v < below` by core triple. */
-export const SUPPORTS_PLUGIN = { min: '0.2.5', below: '0.4.0' };
+/** PROVISIONAL (03_c9-wire-client.md section 6): the Pro plugin versions this MCP serves text to, `min <= v < below` by core triple. R-W4: the 0.4.x line (plugin 0.4.1 and 0.4.2) is served. */
+export const SUPPORTS_PLUGIN = { min: '0.2.5', below: '0.5.0' };
 /** Mirrors the service's token refresh window (service.ts REFRESH_BEFORE_MS): inside it the service is asked for a fresh token. */
 const REFRESH_WINDOW_MS = 3 * 86_400_000;
 /** The text form of the tool answer: the body when `ok`, else the one-line `result: ...`. */

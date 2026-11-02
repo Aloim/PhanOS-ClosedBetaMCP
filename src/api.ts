@@ -11,7 +11,20 @@ export class ApiError extends Error {
   }
 }
 
-export type Plan = 'free' | 'pro' | 'business';
+export type Plan = 'free' | 'pro' | 'business' | 'pro_budget';
+
+/** The weekly Pro Budget of a pro_budget plan (C-W3). Present only for that plan; dates are ISO strings. */
+export interface Quota {
+  limitSec: number;
+  usedSec: number;
+  weekStart: string;
+  resetAt: string;
+  /** True when limitSec - usedSec <= 1800 (about 30 minutes left). */
+  warn: boolean;
+  /** True when usedSec >= limitSec. */
+  exhausted: boolean;
+}
+
 export interface Me {
   email: string;
   plan: Plan;
@@ -20,6 +33,10 @@ export interface Me {
   state?: string;
   deviceLimit: number;
   devices: { id: string; label: string; platform: string; lastSeenAt: string }[];
+  /** Feature keys the account holds. Optional: an older server omits it. */
+  features?: string[];
+  /** The weekly Pro Budget; present only for a pro_budget plan (C-W3). */
+  quota?: Quota;
 }
 
 /** The five account states of C1 §3.1. Only `ended` and `never` select Basic; `grace` keeps Pro. */
@@ -123,7 +140,7 @@ export interface Api {
   deleteDevice(session: string, id: string): Promise<void>;
   /** C1 §3.3: best-effort device report, `PUT /api/entitlement/devices/:id/state` with the session bearer. Resolves on 204, throws `ApiError` otherwise. */
   reportDeviceState(session: string, deviceId: string, state: { enabled: LocalEdition; version: string }): Promise<void>;
-  getToken(session: string, deviceId: string): Promise<{ token: string; expiresAt: string; plan: 'pro' | 'business'; serverTime?: number }>;
+  getToken(session: string, deviceId: string): Promise<{ token: string; expiresAt: string; plan: Exclude<Plan, 'free'>; serverTime?: number }>;
   /** `bearer` is the session token for `free` (C1 §3.3, W3) and the entitlement token for `pro`. */
   getManifest(edition: Edition, bearer?: string): Promise<SignedManifest>;
   downloadArchive(edition: Edition, file: string, token?: string): Promise<Buffer>;
@@ -317,9 +334,9 @@ export class HttpApi implements Api {
   }
 
   /** `serverTime` is whole epoch seconds from the answer's `Date` header; absent when the header is missing or unparsable. */
-  async getToken(session: string, deviceId: string): Promise<{ token: string; expiresAt: string; plan: 'pro' | 'business'; serverTime?: number }> {
+  async getToken(session: string, deviceId: string): Promise<{ token: string; expiresAt: string; plan: Exclude<Plan, 'free'>; serverTime?: number }> {
     const res = await this.send(`${this.base}/api/entitlement/token`, { method: 'POST', bearer: session, body: JSON.stringify({ deviceId }) });
-    const body = await this.ok<{ token: string; expiresAt: string; plan: 'pro' | 'business' }>(res);
+    const body = await this.ok<{ token: string; expiresAt: string; plan: Exclude<Plan, 'free'> }>(res);
     const ms = Date.parse(res.headers.get('date') ?? '');
     return Number.isFinite(ms) ? { ...body, serverTime: Math.floor(ms / 1000) } : body;
   }

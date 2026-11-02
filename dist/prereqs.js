@@ -59,6 +59,10 @@ function noteFor(item, platform) {
     }
     return `${item.name}: not found (optional; ${item.why}). ${how}`;
 }
+/** One blocker line for a caller that prints strings (the terminal installer): the item's name, then its reason. */
+export function blockerLine(item) {
+    return `${item.name}: not found, and the install cannot go on without it (${item.why}).`;
+}
 export async function checkPrerequisites(p) {
     const timeoutMs = p.timeoutMs ?? 10_000;
     const found = await Promise.all(PREREQS.map((item) => present(item, p, timeoutMs)));

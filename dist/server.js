@@ -34,7 +34,7 @@ export function buildServer(svc, version, opts = {}) {
     /** M7b: shared by phanos_install and phanos_update. */
     const forceArg = z.boolean().optional().describe('replace files you changed by hand');
     if (wanted('phanos_login')) {
-        server.registerTool('phanos_login', { description: 'Sign in to your PhanOS account from this computer. Shows a code to confirm in the browser; no password is typed here. Every install needs a signed-in account, PhanOS Basic included.', inputSchema: z.object({}) }, () => runTool(() => svc.login()));
+        server.registerTool('phanos_login', { description: 'Sign in to your PhanOS account from this computer. Shows a code to confirm in the browser; no password is typed here. Every install needs a signed-in account, PhanOS Basic included.', inputSchema: z.object({ install: z.boolean().optional().describe('After sign-in, install PhanOS right away') }) }, (args) => runTool(() => svc.login(args)));
     }
     if (wanted('phanos_status')) {
         server.registerTool('phanos_status', { description: 'Show sign-in state, plan, Pro token validity and the installed PhanOS version. Renews the Pro token when it is close to expiry.', inputSchema: z.object({}) }, () => runTool(() => svc.status()));

@@ -46,7 +46,7 @@ const Manifest2Schema = z.object({
   version: Version,
   publishedAt: z.string(),
   artifacts: z.array(z.looseObject({ kind: z.string() })),
-  requires: z.object({ mcp: z.string().optional(), node: z.string().optional() }).optional(),
+  requires: z.object({ mcp: z.string().optional(), node: z.string().optional(), ui: z.string().optional() }).optional(),
 });
 
 export type ManifestV1 = z.infer<typeof Manifest1Schema>;
@@ -75,6 +75,8 @@ export interface VerifiedRelease {
   plugin: VerifiedFile & { files: VerifiedFile | null };
   ui: (VerifiedFile & { platform: string }) | null;
   notes: string[];
+  /** `requires.ui` as a bare X.Y.Z, present only when the manifest declares it. Not checked by `checkRequires`. */
+  requiresUi?: string;
 }
 
 const MALFORMED = 'The release manifest is malformed. Nothing was installed.';
@@ -153,7 +155,7 @@ export function verifySignedManifest(signed: SignedManifest, keys: TrustedKey[],
   return { ...m, file: plugin.file, sha256: plugin.sha256, size: plugin.size };
 }
 
-function parseMinimum(field: 'mcp' | 'node', requirement: string): [number, number, number] {
+function parseMinimum(field: 'mcp' | 'node' | 'ui', requirement: string): [number, number, number] {
   const hit = /^>=(\d{1,9})\.(\d{1,9})\.(\d{1,9})$/.exec(requirement);
   if (!hit) {
     throw new ReleaseVerificationError(`This release declares a "requires.${field}" this installer cannot read (only ">=X.Y.Z" is understood). Nothing was installed. Update it: ${UPDATE_COMMAND}`);
@@ -216,6 +218,7 @@ export function verifyRelease(signed: SignedManifest, keys: TrustedKey[], wireEd
     };
   }
   checkRequires(m, env);
+  const minUi = m.requires?.ui === undefined ? undefined : parseMinimum('ui', m.requires.ui);
   const { plugin, uis, notes } = interpretArtifacts(m);
   let ui: VerifiedRelease['ui'] = null;
   if (m.edition !== 'free') {
@@ -231,6 +234,7 @@ export function verifyRelease(signed: SignedManifest, keys: TrustedKey[], wireEd
     plugin: { file: plugin.file, sha256: plugin.sha256, size: plugin.size, files: { file: plugin.files.file, sha256: plugin.files.sha256, size: plugin.files.size } },
     ui,
     notes,
+    ...(minUi === undefined ? {} : { requiresUi: minUi.join('.') }),
   };
 }
 
