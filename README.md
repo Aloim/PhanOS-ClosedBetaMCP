@@ -13,7 +13,7 @@ You need Node.js 22.12 or newer, Git and Claude Code. Every install signs in wit
 
 The one-command install, in a terminal:
 
-    npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.1 install
+    npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.2 install
 
 It signs you in through your browser (check the code, then choose Connect this device), checks the package
 signature before any file is written, installs PhanOS, registers this server with Claude Code at user scope and
@@ -22,7 +22,7 @@ It ends with the line "Start a new Claude Code session in your project folder, t
 
 Or add the server to Claude Code yourself:
 
-    claude mcp add --scope user phanos -- npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.1
+    claude mcp add --scope user phanos -- npx -y github:Aloim/PhanOS-ClosedBetaMCP#v0.3.2
 
 then ask Claude to run `phanos_login` with `install` (sign-in, then the install), or the tools one by one:
 - `phanos_login` — confirm the code in your browser

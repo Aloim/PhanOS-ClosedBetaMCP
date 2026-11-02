@@ -1441,7 +1441,7 @@ function resolvePaths(env = process.env, homedir2 = osHomedir()) {
 }
 
 // src/version.ts
-var MCP_VERSION = "0.3.1";
+var MCP_VERSION = "0.3.2";
 
 // src/api.ts
 var ApiError = class extends Error {
